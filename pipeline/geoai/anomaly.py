@@ -20,9 +20,9 @@ Scores are robust z-scores per patch row against the bank's own leave-one-place-
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -37,27 +37,54 @@ from .dinov2 import PATCH
 from .probe import DistressProbe
 
 _INF = 1e4
+# Probe logit given to paint patches: far below any seed or grow level, so paint never starts or
+# joins a probe anomaly (road markings are not pavement distress).
+PAINT_LOGIT = -1e3
 
 
-def _knn_mean(Q: torch.Tensor, B: torch.Tensor, k: int, exclude: torch.Tensor | None) -> torch.Tensor:
+_CHUNK = 4096  # queries per distance block (4096 x 49k fp32 = 0.8 GB for a 16k-patch row's neighbours)
+
+
+def _knn_mean(Q: torch.Tensor, B: torch.Tensor, k: int,
+              exclude: torch.Tensor | Callable[[int, int], torch.Tensor] | None) -> torch.Tensor:
     """Mean of the k smallest cosine distances from each row of Q to B (rows L2-normalised).
 
-    exclude: bool (len(Q), len(B)) or (1, len(B)); True entries are ignored.
+    exclude: True entries are ignored. A (1, len(B)) bool tensor applies to every query; a function
+    (i0, i1) -> bool (i1 - i0, len(B)) gives the mask of queries i0..i1-1, so it is built one block
+    at a time (`_exclusion`): a whole (len(Q), len(B)) mask of a 16k-patch row against its three
+    neighbour rows would be 0.8 GB of GPU memory.
     """
     out = []
-    for i in range(0, Q.shape[0], 4096):
-        q = Q[i:i + 4096]
+    for i in range(0, Q.shape[0], _CHUNK):
+        q = Q[i:i + _CHUNK]
         d = 1.0 - q @ B.T
         if exclude is not None:
-            ex = exclude if exclude.shape[0] == 1 else exclude[i:i + 4096]
-            d = d.masked_fill(ex, _INF)
+            d.masked_fill_(exclude(i, i + q.shape[0]) if callable(exclude) else exclude, _INF)
         kk = min(k, d.shape[1])
         out.append(torch.topk(d, kk, dim=1, largest=False).values.mean(1))
     return torch.cat(out) if out else torch.zeros(0, device=Q.device)
 
 
+def _exclusion(q_frame: torch.Tensor, b_frame: torch.Tensor, q_s: torch.Tensor | None = None,
+               b_s: torch.Tensor | None = None, window_m: float = 0.0) -> Callable[[int, int], torch.Tensor]:
+    """Block-wise leave-place-out mask for `_knn_mean`: bank patches of the query's own frame, and
+    (with positions) those within window_m of the query's position on the route."""
+    def mask(i0: int, i1: int) -> torch.Tensor:
+        m = q_frame[i0:i1, None] == b_frame[None, :]
+        if q_s is not None:
+            m |= (q_s[i0:i1, None] - b_s[None, :]).abs() < window_m
+        return m
+    return mask
+
+
 def _kcenter(X: torch.Tensor, m: int, seed: int) -> torch.Tensor:
-    """Greedy k-center coreset indices (PatchCore's selection), deterministic given the seed."""
+    """Greedy k-center coreset indices (PatchCore's selection), deterministic given the seed.
+
+    Each step is one matrix-vector product over all of X, so the loop is bound by memory bandwidth
+    (0.25 ms per step for 15k x 768 fp32 on the RTX 4050 laptop GPU, 187 GB/s). The chosen index
+    stays on the GPU: reading it on the host each step stalled the queue and made the loop 1.5x
+    slower. The arithmetic is the same matrix-vector product as before, so the choice is identical.
+    """
     n = X.shape[0]
     if n <= m:
         return torch.arange(n, device=X.device)
@@ -67,9 +94,9 @@ def _kcenter(X: torch.Tensor, m: int, seed: int) -> torch.Tensor:
     idx[0] = first
     mind = 1.0 - X @ X[first]
     for i in range(1, m):
-        j = int(torch.argmax(mind))
-        idx[i] = j
-        mind = torch.minimum(mind, 1.0 - X @ X[j])
+        j = torch.argmax(mind, 0, keepdim=True)
+        idx[i:i + 1] = j
+        mind = torch.minimum(mind, 1.0 - X @ X.index_select(0, j)[0])
     return idx
 
 
@@ -112,49 +139,70 @@ class PatchBank:
         return (torch.cat([self.rows[i].vecs for i in rows]), torch.cat([self.rows[i].frame for i in rows]),
                 torch.cat([self.rows[i].s for i in rows]))
 
-    def finalize(self, max_collect: int = 16384) -> None:
+    def finalize(self, max_collect: int = 16384, null_samples: int = 10000) -> None:
+        """Trim, coreset and null distribution of every row.
+
+        Memory: the collected patches stay in host memory. The GPU holds only the three rows the
+        current row's neighbour search reads, one block of distances and the finished coresets.
+        Holding every row there, as the first version did, peaked at 7.3 GB for the 51-row bank of
+        session f428 on a 6 GB laptop GPU: the driver spilled to system memory and finalising took
+        231 s. The random draws and the arithmetic of every step are unchanged, so the bank is the
+        same (tests/test_gate.py compares it with the first version's).
+        """
         rng = np.random.default_rng(self.seed)
         dev = self.device
-        raw = []
+        raw: list[tuple[np.ndarray, np.ndarray, np.ndarray] | None] = []
         for r in range(self.gh):
             if not self._v[r]:
                 raise RuntimeError(f"bank row {r} is empty")
             V = np.concatenate(self._v[r])
             F = np.concatenate(self._f[r])
             S = np.concatenate(self._s[r])
+            self._v[r] = self._f[r] = self._s[r] = None  # per-frame pieces are copies: free them now
             if len(V) > max_collect:
                 sel = np.sort(rng.choice(len(V), max_collect, replace=False))
                 V, F, S = V[sel], F[sel], S[sel]
-            raw.append((torch.from_numpy(V).to(dev), torch.from_numpy(F).to(dev), torch.from_numpy(S).to(dev)))
-        self._v = self._f = self._s = None  # free
+            raw.append((V, F, S))
+        self._v = self._f = self._s = None
+        # The null samples are drawn now, in the row order the first version drew them after the
+        # coresets (trimming and coresets draw nothing from rng), so the same patches are sampled.
+        null_sel = [np.sort(rng.choice(len(V), null_samples, replace=False)) if len(V) > null_samples else None
+                    for V, _, _ in raw]
 
-        # Trim likely distress: each patch's k-NN distance to other frames' patches (rows r-1..r+1).
+        # Per row: trim likely distress (each patch's k-NN distance to other frames' patches in rows
+        # r-1..r+1; the most distant trim_frac go), then the k-center coreset of what is left.
         trimmed = 0
-        rows_after_trim = []
+        self.rows = []
+        window: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}  # rows r-1..r+1 on the GPU
         for r in range(self.gh):
             idx = [i for i in (r - 1, r, r + 1) if 0 <= i < self.gh]
-            RV = torch.cat([raw[i][0] for i in idx])
-            RF = torch.cat([raw[i][1] for i in idx])
-            V, F, S = raw[r]
-            d = _knn_mean(V, RV, self.cfg.knn_k, F[:, None] == RF[None, :])
+            for i in [i for i in window if i < idx[0]]:
+                del window[i]
+            for i in idx:
+                if i not in window:
+                    window[i] = tuple(torch.from_numpy(a).to(dev) for a in raw[i])
+            RV = torch.cat([window[i][0] for i in idx])
+            RF = torch.cat([window[i][1] for i in idx])
+            V, F, S = window[r]
+            d = _knn_mean(V, RV, self.cfg.knn_k, _exclusion(F, RF))
             n_keep = max(1, int(round(len(V) * (1.0 - self.cfg.trim_frac))))
             order = torch.argsort(d)[:n_keep]
             trimmed += len(V) - n_keep
-            rows_after_trim.append((V[order], F[order], S[order]))
-        # Coreset per row.
-        self.rows = []
-        for r, (V, F, S) in enumerate(rows_after_trim):
+            V, F, S = V[order], F[order], S[order]
             ci = _kcenter(V, self.cfg.bank_size_per_row, self.seed + r)
             self.rows.append(_RowBank(V[ci], F[ci], S[ci]))
+        del window, RV, RF  # free the GPU for the null step
         # Null distribution per row: leave-place-out distances of the bank patches (all of them,
-        # before trimming, up to 10k), scored exactly like queries against the final bank.
+        # before trimming, up to null_samples), scored exactly like queries against the final bank.
         null = []
-        for r, (V, F, S) in enumerate(raw):
-            if len(V) > 10000:
-                sel = torch.from_numpy(np.sort(rng.choice(len(V), 10000, replace=False))).to(dev)
-                V, F, S = V[sel], F[sel], S[sel]
+        for r in range(self.gh):
+            V, F, S = raw[r]
+            raw[r] = None
+            if null_sel[r] is not None:
+                V, F, S = V[null_sel[r]], F[null_sel[r]], S[null_sel[r]]
+            V, F, S = (torch.from_numpy(a).to(dev) for a in (V, F, S))
             BV, BF, BS = self._neighbours(r)
-            ex = (F[:, None] == BF[None, :]) | ((S[:, None] - BS[None, :]).abs() < self.cfg.exclude_window_m)
+            ex = _exclusion(F, BF, S, BS, self.cfg.exclude_window_m)
             null.append(_knn_mean(V, BV, self.cfg.knn_k, ex).double().cpu().numpy())
         for r in range(self.gh):
             med, q90 = (float(v) for v in np.quantile(null[r], [0.5, 0.9]))
@@ -328,17 +376,45 @@ class AnomalyDetector:
         self.bank.stats["probe_excluded_patches"] = self._probe_excluded
 
     def detect(self, rgb: np.ndarray, s_m: float, gsd_rows_mm: np.ndarray) -> tuple[list[Candidate], dict]:
+        """Crop mode: the merged candidates of one analysis image and its statistics (see `maps`)."""
+        m = self.maps(rgb, s_m, gsd_rows_mm)
+        return m["candidates"], m["diag"]
+
+    def maps(self, rgb: np.ndarray, s_m: float, gsd_rows_mm: np.ndarray) -> dict:
+        """Per-patch maps of one analysis image, and the candidates `detect` reports for it.
+
+        The crop mode ranks whole-image candidates; the segment gate (geoai.gate) scores only the
+        patches and the detections of one road segment. Both read this one computation, so the two
+        modes can't drift apart.
+
+        Returns a dict:
+          z            (gh, gw) float32 bank score u, 0 on paint patches (with mask_paint)
+          probe_logit  (gh, gw) probe logits, PAINT_LOGIT on paint patches (exactly the map the probe
+                       candidates are grown on); None without a probe
+          paint        (gh, gw) bool, patches mostly covered by road paint; all False without mask_paint
+          crack_mask   (H, W) bool analysis-pixel crack mask; None with the crack filter off
+          components   {"dino": [...], "crack": [...], "probe": [...]}: each detector's candidates
+                       before merging, as independent copies. The merged candidates sum the evidence
+                       of all three, so a per-detector total needs these.
+          candidates   merged list, exactly what `detect` returns
+          diag         per-image statistics, exactly what `detect` returns
+        """
         feats = self._features(rgb)
         _, z = self.bank.score(feats, s_m)
         paint = None
         if self.cfg.mask_paint:
             paint = paint_fraction(rgb, self.gh, self.gw, self.cfg.paint_ratio) > self.cfg.paint_patch_frac
             z = np.where(paint, 0.0, z)
-        probe_cands, pdiag = self._probe_candidates(feats, paint)
+        logit = None
+        if self.probe is not None:
+            logit = self.probe.logits(feats)
+            if paint is not None:
+                logit = np.where(paint, PAINT_LOGIT, logit)
+        probe_cands, pdiag = self._probe_candidates(logit)
         thr = self.cfg.score_threshold
         seeds = apply_hysteresis_threshold(z, self.cfg.grow_fraction * thr, thr)
         labels, n = ndimage.label(seeds, structure=np.ones((3, 3), int))
-        cands: list[Candidate] = []
+        dino: list[Candidate] = []
         for i, sl in enumerate(ndimage.find_objects(labels), start=1):
             if sl is None:
                 continue
@@ -351,9 +427,10 @@ class AnomalyDetector:
                 continue
             r0, r1 = sl[0].start, sl[0].stop
             c0, c1 = sl[1].start, sl[1].stop
-            cands.append(Candidate((c0 * PATCH, r0 * PATCH, c1 * PATCH, r1 * PATCH), mass, zmax, 0.0,
-                                   ["dino"], npatch, mass=mass))
+            dino.append(Candidate((c0 * PATCH, r0 * PATCH, c1 * PATCH, r1 * PATCH), mass, zmax, 0.0,
+                                  ["dino"], npatch, mass=mass))
         crack_mask = None
+        crack: list[Candidate] = []
         if self.cracks is not None:
             crack_mask, comps = self.cracks.detect(rgb, gsd_rows_mm)
             if self.crack_cfg.as_candidates:
@@ -361,20 +438,24 @@ class AnomalyDetector:
                     # Crack evidence on the same scale as DINOv2 mass: a crack just at the length and
                     # z thresholds scores min_mass.
                     ev = self.cfg.min_mass * (c.z_max / self.crack_cfg.z_threshold) * (c.length_mm / self.crack_cfg.min_length_mm)
-                    cands.append(Candidate(c.bbox, ev, 0.0, c.z_max, ["crack"], 0, c.length_mm))
-        cands = _merge_boxes(cands + probe_cands, gap=PATCH)
+                    crack.append(Candidate(c.bbox, ev, 0.0, c.z_max, ["crack"], 0, c.length_mm))
+        # _merge_boxes grows the first box of each cluster in place: merge copies, keep the originals.
+        cands = _merge_boxes([replace(c, kinds=list(c.kinds)) for c in dino + crack + probe_cands], gap=PATCH)
         diag = {"z_max": float(z.max()), "z_p99": float(np.percentile(z, 99)),
                 "anomalous_patch_frac": float((z >= thr).mean()),
                 "crack_pixel_frac": float(crack_mask.mean()) if crack_mask is not None else 0.0, **pdiag}
-        return cands, diag
+        return {"z": z, "probe_logit": logit,
+                "paint": paint if paint is not None else np.zeros((self.gh, self.gw), bool),
+                "crack_mask": crack_mask, "components": {"dino": dino, "crack": crack, "probe": probe_cands},
+                "candidates": cands, "diag": diag}
 
-    def _probe_candidates(self, feats: np.ndarray, paint: np.ndarray | None) -> tuple[list[Candidate], dict]:
-        """Regions the probe calls distress; evidence = sum of (logit - grow level) over the region."""
-        if self.probe is None:
+    def _probe_candidates(self, logit: np.ndarray | None) -> tuple[list[Candidate], dict]:
+        """Regions the probe calls distress; evidence = sum of (logit - grow level) over the region.
+
+        logit: the paint-masked probe map from `maps`, None without a probe.
+        """
+        if logit is None:
             return [], {}
-        logit = self.probe.logits(feats)
-        if paint is not None:
-            logit = np.where(paint, -1e3, logit)
         seed = self.probe.seed_logit
         grow = seed - self.cfg.probe_grow_logit
         out: list[Candidate] = []

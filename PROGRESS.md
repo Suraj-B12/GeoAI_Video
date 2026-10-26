@@ -30,6 +30,15 @@ Updated as work lands. If a session ends mid-task, a new session can continue fr
 | VLM PC instructions | `docs/VLM_PC_SETUP.md` | to write |
 | Run on both 26 Oct sessions; review; push | - | after the above |
 
+## Paused 27 Oct 2026 (user asked to pause)
+
+The parallel build workflow (run `wf_6a63583d-206`) was stopped before any builder finished. Its partial work is committed on branch `wip/segment-mode`, not on `main`:
+- `pipeline/geoai/segments.py` (selector, partial);
+- edits to `pipeline/geoai/anomaly.py` (gate `maps()`, partial) and `pipeline/geoai/records.py` (EXIF target, partial);
+- app edits (FocusPlanner range, tilt display, `MountText.kt`, partial).
+
+To resume, re-launch the four builders with the same prompts. Each one first reads the partial files it owns, finishes them and runs its tests. Then come the integrator, the review, the real-session runs and the merge to `main`.
+
 ## How to resume
 
 1. Read `docs/pipeline/13-segment-frames.md`, which is the contract.

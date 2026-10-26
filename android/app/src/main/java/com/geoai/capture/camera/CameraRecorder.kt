@@ -127,6 +127,9 @@ class CameraRecorder(
         else -> "UNCALIBRATED"
     }
     private val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+    /** Lens model for the focus plan and the live road view; null when the characteristics lack a field. */
+    private val lens: FocusPlanner.Lens? by lazy { lensModel() }
+    private val sensorUpDir = FocusPlanner.sensorUp(sensorOrientation)
     private val fpsRange = CameraCatalog.pickFpsRange(chars, settings.fps)
     private val frameDurationNs = 1_000_000_000L / settings.fps
     val analysisSize: Size = CameraCatalog.pickAnalysisSize(chars) ?: Size(640, 360)
@@ -366,9 +369,19 @@ class CameraRecorder(
     }
 
     private fun planFocus(inputs: FocusInputs): FocusPlanner.Plan? {
-        val lens = lensModel() ?: return null
-        val up = FocusPlanner.sensorUp(sensorOrientation) ?: return null
-        return FocusPlanner.plan(lens, inputs.gravity, up, inputs.heightM, settings.resolution.width, settings.resolution.height)
+        val l = lens ?: return null
+        val up = sensorUpDir ?: return null
+        return FocusPlanner.plan(l, inputs.gravity, up, inputs.heightM, settings.resolution.width, settings.resolution.height)
+    }
+
+    /**
+     * Tilt and the road the recorded frame shows (near..far ahead, whether a segment fits) for the current gravity:
+     * the live mount check. Pure computation on immutable camera data, so any thread may call it.
+     */
+    fun roadView(inputs: FocusInputs): FocusPlanner.RoadView? {
+        val l = lens ?: return null
+        val up = sensorUpDir ?: return null
+        return FocusPlanner.roadView(l, inputs.gravity, up, inputs.heightM, settings.resolution.width, settings.resolution.height)
     }
 
     /** Lens model from the camera characteristics; null when the needed fields are missing. */
@@ -439,18 +452,24 @@ class CameraRecorder(
     }
 
     private fun planJson(p: FocusPlanner.Plan) = JSONObject()
-        .put("camera_depression_deg", p.depressionDeg)
+        .put("camera_depression_deg", p.view.tiltDeg)
+        .put("road_ahead_near_m", p.nearRoadM)
+        .put("road_ahead_far_m", p.farRoadM)
         .put("road_depth_near_m", p.nearDepthM)
         .put("road_depth_far_m", p.farDepthM)
         .put("target_diopters", p.targetDiopters)
         .put("predicted_edge_blur_px", p.edgeBlurPx)
         .put("road_rows_active_array", JSONArray().put(p.roiTop).put(p.roiBottom))
         .put("road_rows_frac", JSONArray().put(p.roiTopFrac).put(p.roiBottomFrac))
-        .put("far_road_limit_m", FocusPlanner.FAR_ROAD_M)
+        .put("far_road_limit_m", p.nearRoadM + FocusPlanner.SEGMENT_REACH_M)
+        .put("segment_length_m", FocusPlanner.SEGMENT_LENGTH_M)
+        .put("segment_window_m", FocusPlanner.SEGMENT_WINDOW_M)
+        .put("view_far_m", p.view.farM ?: JSONObject.NULL)
+        .put("segment_fits", p.view.segmentFits)
 
     private fun noteFor(plan: FocusPlanner.Plan?): String {
         val method = focusMethod.replace('_', ' ')
-        return if (plan != null) String.format(Locale.ROOT, "%s; road %.1f-%.1f m", method, plan.nearDepthM, plan.farDepthM) else method
+        return if (plan != null) String.format(Locale.ROOT, "%s; road %.1f-%.1f m ahead", method, plan.nearRoadM, plan.farRoadM) else method
     }
 
     /** Re-applies a previous lock (camera reopened after an error) without re-running AF. */

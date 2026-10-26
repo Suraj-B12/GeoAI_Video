@@ -20,8 +20,16 @@ data class SurveyStatus(
     val exposureMode: String = "",
     val focusMode: String = "",
     val focusDiopters: Float? = null,
-    /** How focus was set and for which road distances, e.g. "geometry sweep confirmed; road 1.4-4.0 m". */
+    /** How focus was set and for which road distances, e.g. "geometry sweep confirmed; road 1.4-7.4 m ahead". */
     val focusNote: String = "",
+    /** Camera tilt below the horizontal from gravity, degrees (negative: looking up); null without gravity. */
+    val tiltDeg: Double? = null,
+    /** Road the recorded frame shows along its centre column, metres ahead of the camera nadir (FocusPlanner.RoadView). */
+    val roadNearM: Double? = null,
+    /** Farthest visible road, metres ahead; FocusPlanner.MAX_ROAD_M with the horizon in the frame. */
+    val roadFarM: Double? = null,
+    /** A 5 m segment plus its 1 m candidate window is in view (near + 6 m <= far); null while the view is unknown. */
+    val segmentFits: Boolean? = null,
     val exposureNs: Long? = null,
     val iso: Int? = null,
     val lowLight: Boolean = false,

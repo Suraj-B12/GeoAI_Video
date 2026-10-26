@@ -68,6 +68,14 @@ def utc_strings(utc_ms: float, offset_minutes: int) -> dict:
 
 
 def build_exif(rec: dict, make: str, model: str, software: str, offset_minutes: int) -> Image.Exif:
+    """EXIF for a crop record (crop mode) or a `geoai.segment.v1` record (segment mode).
+
+    GPS = camera position at the capture time; GPSDest = what the image is about: the anomaly centroid
+    (`rec["anomaly"]`, crop mode) or the segment centre (`rec["target"]`, segment mode). The capture time
+    is the record's top-level `utc_ms` (crop mode) or, when that key is absent, `rec["frame"]["utc_ms"]`
+    (segment mode keeps every time inside its frame block). Crop records always carry `utc_ms` and no
+    `target`, so their EXIF bytes are exactly what they were before segment mode existed.
+    """
     ex = Image.Exif()
     ex[ExifTags.Base.Make] = make or "unknown"
     ex[ExifTags.Base.Model] = model or "unknown"
@@ -75,8 +83,9 @@ def build_exif(rec: dict, make: str, model: str, software: str, offset_minutes: 
     ex[ExifTags.Base.Orientation] = 1  # pixels are stored upright
     exif_ifd = {ExifTags.Base.ImageUniqueID: unique_id(rec["id"])}
     gps: dict = {ExifTags.GPS.GPSVersionID: b"\x02\x03\x00\x00", ExifTags.GPS.GPSMapDatum: "WGS-84"}
-    if rec.get("utc_ms") is not None:
-        ts = utc_strings(rec["utc_ms"], offset_minutes)
+    utc_ms = rec["utc_ms"] if "utc_ms" in rec else (rec.get("frame") or {}).get("utc_ms")
+    if utc_ms is not None:
+        ts = utc_strings(utc_ms, offset_minutes)
         exif_ifd.update({ExifTags.Base.DateTimeOriginal: ts["exif_local"],
                          ExifTags.Base.SubsecTimeOriginal: ts["exif_subsec"],
                          ExifTags.Base.OffsetTimeOriginal: ts["exif_offset"]})
@@ -102,13 +111,13 @@ def build_exif(rec: dict, make: str, model: str, software: str, offset_minutes: 
             gps[ExifTags.GPS.GPSTrack] = _rat(cam["heading_deg"] % 360, 100)
             gps[ExifTags.GPS.GPSImgDirectionRef] = "T"
             gps[ExifTags.GPS.GPSImgDirection] = _rat(cam.get("view_direction_deg", cam["heading_deg"]) % 360, 100)
-    tgt = rec.get("anomaly") or {}
+    tgt = rec.get("target") or rec.get("anomaly") or {}
     if tgt.get("lat") is not None:
         gps[ExifTags.GPS.GPSDestLatitudeRef] = "N" if tgt["lat"] >= 0 else "S"
         gps[ExifTags.GPS.GPSDestLatitude] = _dms(tgt["lat"])
         gps[ExifTags.GPS.GPSDestLongitudeRef] = "E" if tgt["lon"] >= 0 else "W"
         gps[ExifTags.GPS.GPSDestLongitude] = _dms(tgt["lon"])
-        if tgt.get("bearing_deg") is not None:
+        if tgt.get("bearing_deg") is not None and tgt.get("distance_m") is not None:
             gps[ExifTags.GPS.GPSDestBearingRef] = "T"
             gps[ExifTags.GPS.GPSDestBearing] = _rat(tgt["bearing_deg"] % 360, 100)
             gps[ExifTags.GPS.GPSDestDistanceRef] = "K"

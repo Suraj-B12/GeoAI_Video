@@ -511,6 +511,16 @@ private fun StatusPanel(s: SurveyStatus, modifier: Modifier) {
             "PORTRAIT" -> "PORTRAIT: mount in landscape"
             else -> "unknown"
         }, orientColor)
+        // Mount check for segment mode: the frame must show road from near to near + 6 m (5 m segment + 1 m window).
+        val lookingUp = (s.tiltDeg ?: 0.0) < 0
+        Stat("Tilt", MountText.tilt(s.tiltDeg), if (lookingUp) StatusColors.fail else Color.Unspecified)
+        Stat("Road in view", MountText.roadRange(s.roadNearM, s.roadFarM, s.tiltDeg != null),
+            if (s.tiltDeg != null && s.roadNearM == null) StatusColors.fail else Color.Unspecified)
+        Stat(MountText.segmentLabel, MountText.segment(s.roadNearM, s.segmentFits), when (s.segmentFits) {
+            true -> StatusColors.pass
+            false -> StatusColors.fail
+            null -> Color.Unspecified
+        })
         val gnssOk = (s.gnssAccM ?: 99f) <= 5f && (s.gnssFixAgeS ?: 99.0) < 2.0
         Stat("GNSS", s.gnssAccM?.let { f("±%.1f m, %s sats, age %.1fs", it, s.gnssSats?.toString() ?: "?", s.gnssFixAgeS ?: 0.0) } ?: "no fix",
             if (gnssOk) StatusColors.pass else StatusColors.warn)

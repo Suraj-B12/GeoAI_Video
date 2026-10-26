@@ -878,6 +878,8 @@ class SurveyService : Service() {
                 val ready = gnssReady()
                 maybeAutoStart(ready)
                 val roadNewM = synchronized(coverageLock) { coverage?.newM }
+                // Live mount check: tilt and the road the frame shows, so the operator sees whether a segment fits.
+                val view = recorder?.roadView(focusInputs())
                 update { s ->
                     s.copy(
                         gnssReady = ready,
@@ -901,6 +903,10 @@ class SurveyService : Service() {
                         charging = th?.charging == true,
                         freeGb = freeGb ?: s.freeGb,
                         orientation = verdict.name,
+                        tiltDeg = view?.tiltDeg,
+                        roadNearM = view?.nearM,
+                        roadFarM = view?.farM,
+                        segmentFits = view?.segmentFits,
                         warnings = currentWarnings(),
                     )
                 }
