@@ -1,0 +1,1 @@
+Does this image contain any visible road or pavement surface? Be generous — partial / damaged / blurry pavement still counts. Reply with exactly one word: YES, NO, or UNSURE.

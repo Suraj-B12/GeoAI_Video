@@ -1,0 +1,1 @@
+f433177089a681826f849f194ece3bb48f4d63fb38d32fc837e3dc7a4e5641fb *dinov2_vits14_reg4_pretrain.pth

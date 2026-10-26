@@ -1,0 +1,15 @@
+# Versions this pipeline was developed and tested with (Python 3.10, Windows 11).
+# Newer minor versions should work; pin these in the offline wheelhouse for repeatable results.
+numpy==2.0.0
+scipy==1.15.3
+pandas==2.3.3
+pillow==10.4.0
+opencv-python==5.0.0.93
+av==17.1.0
+shapely==2.1.2
+pymap3d==3.2.0
+scikit-image==0.24.0
+# torch: install the CUDA build on the pipeline PC (tested with 2.9.1+cu126 on an RTX 4050, and 2.9.1+cpu).
+# The CPU-only wheel makes device "auto" fall back to the CPU silently: check torch.cuda.is_available().
+torch==2.9.1
+pytest==9.0.2

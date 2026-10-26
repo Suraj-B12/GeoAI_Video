@@ -1,0 +1,15 @@
+# Normalise text to LF in the repository.
+* text=auto
+
+# Byte-exact files (hashed by their owners or by us): never converted.
+vlm_handoff/prompts/** -text
+pipeline/models/** -text
+pipeline/tests/data/** -text
+*.npz binary
+*.pth binary
+*.jar binary
+
+# Shell scripts must keep LF; Windows batch files CRLF.
+gradlew text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf

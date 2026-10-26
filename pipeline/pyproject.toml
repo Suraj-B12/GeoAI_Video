@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geoai-pipeline"
+version = "0.1.0"
+description = "Offline extraction of non-healthy pavement segments from GeoAI Capture sessions, cropped for the Qwen2.5-VL classifier"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.0",
+    "pillow>=10.0",
+    "opencv-python>=4.8",
+    "av>=12",
+    "shapely>=2.0",
+    "pymap3d>=3.0",
+    "torch>=2.1",
+    "scikit-image>=0.21",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+geoai = "geoai.cli:main"
+
+[tool.setuptools]
+packages = ["geoai"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: end-to-end tests that run DINOv2 on the CPU (minutes)",
+]

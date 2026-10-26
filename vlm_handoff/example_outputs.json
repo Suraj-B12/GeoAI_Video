@@ -1,0 +1,244 @@
+{
+  "source": "eval_results/stage2_probe_raw_attain.json (847 Attain WS_V2.0 frames, run 2026-09-23/24)",
+  "settings": {
+    "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "quantization_bits": 4,
+    "max_pixels": 1048576,
+    "prompts": "v2_improved_baseline",
+    "stage2_confidence_mode": "field",
+    "stage2_prompt_sha": "9da1601cfec54f76",
+    "run_v0": true,
+    "variants": [
+      "min:def",
+      "min:name",
+      "tax:def"
+    ],
+    "probe_questions_sha": "29d693d77371cbd3",
+    "generation": "greedy (do_sample=False), repetition_penalty 1.05 from the checkpoint's generation_config; max_new_tokens 12 (Stage 1) / 200 (Stage 2)"
+  },
+  "how_to_read": "stage2 was run on every frame in this evaluation, also where production would skip it (Stage 1 = Normal); 'ran_in_production' says which. probe_p_yes is the per-type Yes/No probe on the full frame (shadow mode: recorded, never used for labels).",
+  "examples": [
+    {
+      "verdict": "right",
+      "note": "Both annotated classes named, nothing extra. Auto-accepted.",
+      "image": "Attain_SMP_WS_v2_000536.jpg",
+      "sample_file": "sample_images/09_examples/example_1_right/Attain_SMP_WS_v2_000536__model_input_1484x504.png",
+      "original_size": [
+        1479,
+        508
+      ],
+      "ground_truth_attain": {
+        "Alligator crack": {
+          "severity": "Low",
+          "share_of_annotated_box_area": 0.4
+        },
+        "Linear crack": {
+          "severity": "High",
+          "share_of_annotated_box_area": 0.6
+        }
+      },
+      "stage1": {
+        "raw_output": "Distress",
+        "label": "Distress",
+        "confidence": 0.8411,
+        "time_ms": 1299.2
+      },
+      "stage2": {
+        "ran_in_production": true,
+        "raw_output": "DISTRESS_TYPES: Alligator Cracking, Longitudinal Cracking\nSEVERITY: Medium\nDESCRIPTION: Interconnected web-pattern cracks and longitudinal cracks along the wheel path indicate moderate structural damage (IRC:82 §7.3.3, §7.3.4).",
+        "parsed": {
+          "distress_types": [
+            "Alligator Cracking",
+            "Longitudinal Cracking"
+          ],
+          "severity": "Medium",
+          "description": "Interconnected web-pattern cracks and longitudinal cracks along the wheel path indicate moderate structural damage (IRC:82 §7.3.3, §7.3.4)."
+        },
+        "confidence_field_gate": 0.8648,
+        "confidence_first_label": 0.4142,
+        "confidence_whole_sequence": 0.8185,
+        "time_ms": 7993.9
+      },
+      "probe_p_yes": {
+        "Transverse Cracking": 0.809465,
+        "Longitudinal Cracking": 0.799938,
+        "Hairline Cracks": 0.741638,
+        "Block Cracking": 0.546923,
+        "Edge Cracking": 0.514085,
+        "Alligator Cracking": 0.460895,
+        "Streaking": 0.325933,
+        "Stripping": 0.29018,
+        "Ravelling": 0.255091,
+        "Hungry Surface": 0.218376,
+        "Edge Breaking": 0.184716,
+        "Settlement": 0.138833,
+        "Potholes": 0.134826,
+        "Shoving": 0.127541,
+        "Patching": 0.095719,
+        "Rutting": 0.093184,
+        "Shallow Depression": 0.068014,
+        "Bleeding": 0.058776,
+        "Slippage": 0.043307,
+        "Corrugation": 0.040258
+      },
+      "production_decision": {
+        "status": "auto-accepted",
+        "distress_types": [
+          "Alligator Cracking",
+          "Longitudinal Cracking"
+        ],
+        "severity": "Medium"
+      }
+    },
+    {
+      "verdict": "wrong, auto-accepted",
+      "note": "Weathering covers 97% of the annotated area and a pothole is present; the model names only linear cracks, with confidence above both gates, so production would NOT send it to review.",
+      "image": "Attain_SMP_WS_v2_000020.jpg",
+      "sample_file": "sample_images/09_examples/example_2_wrong_but_auto_accepted/Attain_SMP_WS_v2_000020__model_input_644x644.png",
+      "original_size": [
+        640,
+        640
+      ],
+      "ground_truth_attain": {
+        "Linear crack": {
+          "severity": "High",
+          "share_of_annotated_box_area": 0.0162
+        },
+        "Pothole": {
+          "severity": "High",
+          "share_of_annotated_box_area": 0.0173
+        },
+        "Weathering": {
+          "severity": "High",
+          "share_of_annotated_box_area": 0.9665
+        }
+      },
+      "stage1": {
+        "raw_output": "Distress",
+        "label": "Distress",
+        "confidence": 0.8833,
+        "time_ms": 980.0
+      },
+      "stage2": {
+        "ran_in_production": true,
+        "raw_output": "DISTRESS_TYPES: Longitudinal Cracking, Transverse Cracking\nSEVERITY: Medium\nDESCRIPTION: Multiple interconnected cracks, both longitudinal and transverse, with widths ranging from 3-6 mm, indicating moderate distress (IRC:82 §7.3.4, §7.3.5).",
+        "parsed": {
+          "distress_types": [
+            "Longitudinal Cracking",
+            "Transverse Cracking"
+          ],
+          "severity": "Medium",
+          "description": "Multiple interconnected cracks, both longitudinal and transverse, with widths ranging from 3-6 mm, indicating moderate distress (IRC:82 §7.3.4, §7.3.5)."
+        },
+        "confidence_field_gate": 0.8835,
+        "confidence_first_label": 0.5108,
+        "confidence_whole_sequence": 0.7889,
+        "time_ms": 8250.9
+      },
+      "probe_p_yes": {
+        "Longitudinal Cracking": 0.787733,
+        "Transverse Cracking": 0.616536,
+        "Rutting": 0.562191,
+        "Hairline Cracks": 0.525404,
+        "Streaking": 0.378456,
+        "Block Cracking": 0.362736,
+        "Stripping": 0.349478,
+        "Alligator Cracking": 0.323157,
+        "Ravelling": 0.310934,
+        "Hungry Surface": 0.258918,
+        "Corrugation": 0.173506,
+        "Edge Cracking": 0.173086,
+        "Settlement": 0.129061,
+        "Shoving": 0.118342,
+        "Shallow Depression": 0.111341,
+        "Edge Breaking": 0.106195,
+        "Patching": 0.076992,
+        "Potholes": 0.048991,
+        "Bleeding": 0.041193,
+        "Slippage": 0.022768
+      },
+      "production_decision": {
+        "status": "auto-accepted",
+        "distress_types": [
+          "Longitudinal Cracking",
+          "Transverse Cracking"
+        ],
+        "severity": "Medium"
+      }
+    },
+    {
+      "verdict": "missed by Stage 1",
+      "note": "Stage 1 says Normal at 0.957, so production never runs Stage 2; every probe P(yes) is below the safety-net threshold, so it is auto-classified Normal. Stage 2, forced for this record, also says Normal.",
+      "image": "Attain_SMP_WS_v2_000490.jpg",
+      "sample_file": "sample_images/09_examples/example_3_stage1_miss/Attain_SMP_WS_v2_000490__model_input_1344x756.png",
+      "original_size": [
+        1920,
+        1080
+      ],
+      "ground_truth_attain": {
+        "Linear crack": {
+          "severity": "Low",
+          "share_of_annotated_box_area": 0.9639
+        },
+        "Pothole": {
+          "severity": "Low",
+          "share_of_annotated_box_area": 0.0361
+        }
+      },
+      "stage1": {
+        "raw_output": "Normal",
+        "label": "Normal",
+        "confidence": 0.9567,
+        "time_ms": 1510.0
+      },
+      "stage2": {
+        "ran_in_production": false,
+        "raw_output": "DISTRESS_TYPES: Normal - No distress detected\nSEVERITY: N/A\nDESCRIPTION: The road appears smooth with no visible signs of distress according to IRC:82 standards.",
+        "parsed": {
+          "distress_types": [
+            "Normal"
+          ],
+          "severity": "None",
+          "description": "The road appears smooth with no visible signs of distress according to IRC:82 standards."
+        },
+        "confidence_field_gate": 0.732,
+        "confidence_first_label": 0.732,
+        "confidence_whole_sequence": 0.8031,
+        "time_ms": 7022.2
+      },
+      "probe_p_yes": {
+        "Longitudinal Cracking": 0.08959,
+        "Potholes": 0.077698,
+        "Transverse Cracking": 0.07591,
+        "Edge Breaking": 0.069383,
+        "Patching": 0.063432,
+        "Edge Cracking": 0.061538,
+        "Shallow Depression": 0.057608,
+        "Hairline Cracks": 0.053064,
+        "Streaking": 0.044758,
+        "Hungry Surface": 0.038589,
+        "Shoving": 0.038306,
+        "Stripping": 0.033419,
+        "Ravelling": 0.024848,
+        "Alligator Cracking": 0.022984,
+        "Bleeding": 0.022668,
+        "Rutting": 0.020853,
+        "Block Cracking": 0.018466,
+        "Slippage": 0.016338,
+        "Settlement": 0.014657,
+        "Corrugation": 0.009648
+      },
+      "production_decision": {
+        "status": "auto-accepted (Normal)",
+        "distress_types": [],
+        "severity": "None",
+        "stage1_safety_net": {
+          "flagged": false,
+          "strongest_type": "Longitudinal Cracking",
+          "p_yes": 0.08959,
+          "threshold": 0.148936
+        }
+      }
+    }
+  ]
+}

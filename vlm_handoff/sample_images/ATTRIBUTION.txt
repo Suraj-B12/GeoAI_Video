@@ -1,0 +1,35 @@
+Sample images: Attain SMP WS_V2.0 frames, as our model receives them
+====================================================================
+
+Source
+  Attain pavement distress dataset, subset Attain_SMP_WS_V2.0
+  Amirkabir University of Technology, Tehran. Mendeley Data, doi:10.17632/nykrzdm74f/1
+  Licence: CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+
+Changes made
+  Each frame was resized exactly as our production image processor resizes it before
+  the model sees it (Qwen2.5-VL smart_resize: aspect ratio kept, sides rounded to
+  multiples of 28, at most 1,048,576 pixels; torchvision bicubic with antialiasing),
+  and saved losslessly as PNG. For every file we checked that the processor produces
+  identical model input tensors from the PNG and from the original JPEG.
+
+These are EVALUATION frames, not training images. The model is used without training.
+
+Folders
+  01-07  three frames per Attain class, chosen where that class has the largest
+         annotated area, from different 20-frame road blocks and frame sizes
+  08     three frames with no distress annotation
+  09     the three worked examples in ../example_outputs.json
+
+manifest.csv columns
+  file                              path of the PNG
+  our_label                         what our pipeline calls the Attain class
+  original_size / model_input_size  before and after the processor's resize
+  visual_tokens                     image tokens the model receives
+  pixel_identical_to_processor      the check described above
+  attain_classes                    Attain annotations: severity, share of annotated box area
+  stage1                            our Stage 1 answer and confidence (stored run, production settings)
+  production_result                 what production would output and whether it goes to review
+  stage2_raw_if_forced              Stage 2's raw text when run regardless of Stage 1
+  probe_max_headline_p_yes          strongest Stage 1 safety-net probe score (threshold 0.149;
+                                    the threshold was fitted on these same 847 frames)

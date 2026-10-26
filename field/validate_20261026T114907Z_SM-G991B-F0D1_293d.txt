@@ -1,0 +1,26 @@
+PASS  spec_version                   1.1
+PASS  boot count                     no reboot during the session
+INFO  session                        20261026T114907Z_SM-G991B-F0D1_293d type=survey end=user_stop
+PASS  camera timestamp source        REALTIME
+PASS  exposure mode                  MANUAL_SHUTTER_AUTO_ISO
+INFO  streams                        encoder+analysis timestamp base SENSOR
+PASS  mount orientation              UPRIGHT
+PASS  checksums                      13 files match manifest
+PASS  signature                      ECDSA P-256 signature valid for the manifest payload
+PASS  seg_0001.mp4 (hevc 3840x2160)  3049 samples == frames.csv rows
+PASS  seg_0001.mp4 PTS order         strictly increasing, unique
+INFO  seg_0001.mp4 PTS drift         max 0.63 ms vs frames.csv (expected; never use container PTS as time)
+PASS  frames.csv t_ns                strictly increasing
+PASS  frame metadata join            all 3049 frames matched
+PASS  match residual                 max 1.0 us
+PASS  dropped frames                 0 gaps > 1.5x median (33.33 ms); 0.00%
+INFO  frame rate                     30.00 fps median
+INFO  exposure                       median 1/1000 s, longest 1/782 s
+PASS  mock locations                 none
+PASS  GNSS brackets video            fixes exist before the first and after the last frame
+INFO  GNSS rate                      0.99 fixes/s during recording
+PASS  GNSS max gap                   1.03 s
+INFO  GNSS accuracy                  median 6.0 m (68%)
+INFO  GNSS fix->receipt              median 4.1 ms (0 ms suggests fixes are stamped on delivery)
+INFO  imu rates                      acc 200 Hz, game_rv 50 Hz, gravity 50 Hz, gyro 200 Hz, mag 50 Hz
+PASS  elapsed-monotonic offset       spread 0.000 ms over 15 samples (non-zero = device slept)

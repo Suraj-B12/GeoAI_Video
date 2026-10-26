@@ -1,0 +1,113 @@
+model:
+  name: "Qwen2.5-VL-7B-Instruct, base weights, no adapter, with our 'v2' IRC:82 prompts"
+  version_or_hash: "Qwen/Qwen2.5-VL-7B-Instruct@cc594898137f460bfe9f0759e9844b3ce807cfb5 | prompts v2 (Stage 2 prompt id 9da1601cfec54f76; per-file SHA-256 in prompts/SHA256SUMS.txt) | probe config sha256 c3797e02ff17 | code commit a59eec189f1b"
+  base_architecture: "Qwen2.5-VL: ViT vision encoder with dynamic resolution plus Qwen2.5 7B language model (transformers Qwen2_5_VLForConditionalGeneration)"
+  parameters: "8,292,166,656 (marketed as 7B; includes the vision encoder). Served as 4-bit NF4 weights with bf16 compute."
+  adaptation: "prompt-only"   # an RDD2022 QLoRA adapter exists but is switched off: it stopped naming potholes on Attain (see notes 6.1)
+  licence: "Apache-2.0 (model weights). Our prompts and code: no licence declared."
+runtime:
+  how_run: "http_server"      # FastAPI + uvicorn, one worker. The same classifier is also callable as a Python function.
+  endpoint_or_command: "POST http://<vlm-host>:8000/classify (multipart/form-data, field 'file'); POST /classify/base64 {\"image\": \"<base64>\"}; GET /health for model, prompt and config"
+  reachable_over_lan: null    # [CONFIRM] the server listens on 0.0.0.0:8000; reachability depends on the lab network and Windows Firewall
+  needs_internet: false       # weights are in the local Hugging Face cache; run with HF_HUB_OFFLINE=1; not yet tested with the network unplugged
+  gpu: "1x NVIDIA RTX A5000 24 GB (driver 596.51), Windows 11 Pro, 128 GB RAM, torch 2.5.1+cu121, transformers 4.57.6, bitsandbytes 0.44.1, SDPA attention"
+  images_per_second: 0.06     # approx.: ≈16-18 s per image as configured, ≈11 s with per-tile probe recording off (≈0.09/s); summed from per-stage medians, not timed end to end
+  max_batch: 1                # one image at a time; concurrent requests wait on a lock
+  sampling: {temperature: 0, top_p: null, max_tokens: 200, seed: null}   # greedy decoding (do_sample=False); repetition_penalty 1.05 from the checkpoint; Stage 1 max 12 tokens, Stage 2 max 200
+  logs_inputs: false          # /classify keeps no copy of the image; request lines and error tracebacks go to the server log
+input:
+  formats: [jpeg, png, webp, bmp, tiff]   # max 10 MB, max 4096x4096, min 32x32; converted to 8-bit RGB, no colour management
+  preferred_size_px: "min_pixels=7168, max_pixels=1048576. Send at most 1,048,576 px with each side a multiple of 28, e.g. 1344x756, 1176x868, 1008x1008."
+  resize_method: "dynamic"    # aspect ratio kept; sides rounded to multiples of 28; bicubic downscale only above max_pixels; no padding, no cropping
+  images_per_request: 1
+  metadata_channel: "not_used"
+  overlay_example_attached: false
+  prompt_template: |
+    Not pasted inline: the Stage 2 system prompt alone is 14,892 characters.
+    The byte-exact UTF-8 files, with SHA-256 sums, are in prompts/:
+      stage1_system.txt + stage1_user.txt       Stage 1: answers "Normal" or "Distress"
+      stage2_system.txt + stage2_user.txt       Stage 2: DISTRESS_TYPES / SEVERITY / DESCRIPTION
+      probe_system.txt + probe_questions.txt    per-type Yes/No probe (20 questions, recorded only)
+      rendered_*_chat.txt                       full Qwen chat-template text of each call
+    Every call: system turn = the system prompt; user turn = the image, then the user text.
+    Language: English. Any byte change makes a new prompt version that must be re-evaluated.
+  accepts_extra_context: []   # none was used in any evaluation; adding some is a prompt change (see notes 2.6)
+  expects_centered_distress: false   # evaluated on whole frames and photos, with the distress anywhere
+  margin_fraction: null       # never evaluated on crops
+training_data:
+  sources: []                 # no training. Evaluated on Attain WS_V2.0 (vehicle-mounted smartphone video frames) and Bengaluru citizen phone photos (unlabelled)
+  viewpoint: "oblique"        # Attain: forward-facing through the windshield. Bengaluru: handheld close-ups.
+  typical_distance_m: null    # not recorded in either source
+  images_per_class: {}        # no training; evaluation counts per class are in notes 3.4
+  regions: []                 # no training; evaluation: Tehran (Attain), Bengaluru (production, unlabelled)
+  labellers: "No training labels. Attain labels are by the dataset's authors; their guideline and agreement were not reported to us. We mapped the Attain classes to IRC:82 names."
+  includes_no_distress_images: null  # no training; the evaluation includes 78 Attain frames with no distress annotation
+  augmentations: []
+  sample_images_attached: true       # evaluation frames, NOT training images, saved exactly as the model receives them
+output:
+  labels:                     # what Stage 2 may put in distress_types
+    - {code: "7.2.1", name: "Bleeding", irc_clause: "IRC:82-2015 §7.2.1", severity_scale: "Low/Medium/High"}
+    - {code: "7.2.3", name: "Streaking", irc_clause: "IRC:82-2015 §7.2.3", severity_scale: "N/A"}
+    - {code: "7.2.4", name: "Hungry Surface", irc_clause: "IRC:82-2015 §7.2.4", severity_scale: "N/A"}
+    - {code: "7.3.2", name: "Hairline Cracks", irc_clause: "IRC:82-2015 §7.3.2", severity_scale: "N/A"}
+    - {code: "7.3.3", name: "Alligator Cracking", irc_clause: "IRC:82-2015 §7.3.3", severity_scale: "Low/Medium/High"}
+    - {code: "7.3.4", name: "Longitudinal Cracking", irc_clause: "IRC:82-2015 §7.3.4", severity_scale: "Low/Medium/High"}
+    - {code: "7.3.5", name: "Transverse Cracking", irc_clause: "IRC:82-2015 §7.3.5 (includes block cracking, §7.3.5.1)", severity_scale: "Low/Medium/High"}
+    - {code: "7.3.6", name: "Edge Cracking", irc_clause: "IRC:82-2015 §7.3.6", severity_scale: "Low/Medium/High"}
+    - {code: "7.4.1", name: "Slippage", irc_clause: "IRC:82-2015 §7.4.1", severity_scale: "Low/High"}
+    - {code: "7.4.2", name: "Rutting", irc_clause: "IRC:82-2015 §7.4.2", severity_scale: "Low/High"}
+    - {code: "7.4.3", name: "Corrugation", irc_clause: "IRC:82-2015 §7.4.3", severity_scale: "N/A"}
+    - {code: "7.4.4", name: "Shoving", irc_clause: "IRC:82-2015 §7.4.4", severity_scale: "N/A"}
+    - {code: "7.4.5", name: "Shallow Depression", irc_clause: "IRC:82-2015 §7.4.5", severity_scale: "N/A"}
+    - {code: "7.4.6", name: "Settlement", irc_clause: "IRC:82-2015 §7.4.6", severity_scale: "N/A"}
+    - {code: "7.5.1", name: "Stripping", irc_clause: "IRC:82-2015 §7.5.1", severity_scale: "N/A"}
+    - {code: "7.5.2", name: "Ravelling", irc_clause: "IRC:82-2015 §7.5.2", severity_scale: "Low/Medium/High"}
+    - {code: "7.5.3", name: "Potholes", irc_clause: "IRC:82-2015 §7.5.3", severity_scale: "Small/Medium/Large"}
+    - {code: "7.5.4", name: "Edge Breaking", irc_clause: "IRC:82-2015 §7.5.4", severity_scale: "N/A"}
+    - {code: "CI-PATCH", name: "Patching", irc_clause: "IRC:82-2015 §5.1, Tables 5.1-5.3 (condition indicator, not a distress)", severity_scale: "N/A"}   # per-type probe only; not in the Stage 2 list
+    - {code: "NORMAL", name: "Normal", irc_clause: "-", severity_scale: "N/A"}   # Stage 1 'Normal', or Stage 2 'Normal - No distress detected'
+  irc_edition: "IRC:82-2015"  # First Revision, June 2015; not checked against IRC:82-2023
+  covers_concrete_irc_sp_83: false
+  multi_label: true           # comma-separated list in the model's own order; the first label is NOT the dominant one (see notes 4.2)
+  severity: {provided: true, scale: ["Low/Medium/High", "Low/High (Slippage, Rutting)", "Small/Medium/Large (Potholes)", "N/A (9 types)"], criteria: "IRC:82-2015 thresholds (crack width 1-3 / 3-6 / >6 mm; pothole depth 25 / 50 mm and width 200 / 500 mm; rut depth 4-10 / >10 mm) estimated by eye from reference objects. One severity per image, not per label. The API maps it to None/Low/Medium/High/Unknown (Small->Low, Large->High, N/A->None). Not validated."}
+  has_no_distress_class: true
+  has_uncertain_class: false  # no label; a needs_expert_review flag is set below 0.80 confidence instead
+  confidence: {provided: true, calibrated: false, logprobs_available: true}   # all scores come from logits; per-type probe P(yes) is Platt-calibrated on Attain only
+  measurements: []            # no widths, areas or boxes; mm values in DESCRIPTION are visual guesses
+  format: "free_text"         # three fixed lines parsed server-side into JSON; not grammar-constrained
+  example_outputs:            # real stored outputs at production settings; full records in example_outputs.json
+    - image: Attain_SMP_WS_v2_000536.jpg   # right labels: Attain has Linear + Alligator crack
+      stage1: "Distress (0.8411)"
+      stage2_raw: "DISTRESS_TYPES: Alligator Cracking, Longitudinal Cracking\nSEVERITY: Medium\nDESCRIPTION: Interconnected web-pattern cracks and longitudinal cracks along the wheel path indicate moderate structural damage (IRC:82 §7.3.3, §7.3.4)."
+      stage2_confidence: 0.8648
+      decision: "auto-accepted"
+    - image: Attain_SMP_WS_v2_000020.jpg   # WRONG: weathering is 97% of the annotated area and a pothole is present
+      stage1: "Distress (0.8833)"
+      stage2_raw: "DISTRESS_TYPES: Longitudinal Cracking, Transverse Cracking\nSEVERITY: Medium\nDESCRIPTION: Multiple interconnected cracks, both longitudinal and transverse, with widths ranging from 3-6 mm, indicating moderate distress (IRC:82 §7.3.4, §7.3.5)."
+      stage2_confidence: 0.8835
+      decision: "auto-accepted (wrong, not sent to review)"
+    - image: Attain_SMP_WS_v2_000490.jpg   # WRONG: Attain has Linear crack + a small pothole
+      stage1: "Normal (0.9567)"
+      stage2_raw: "(not run in production; forced for the record: DISTRESS_TYPES: Normal - No distress detected)"
+      stage2_confidence: null
+      decision: "auto-accepted as Normal; the safety-net probe stayed below its threshold (0.090 < 0.149)"
+evaluation:
+  per_class_metrics_attached: true   # tables in notes §5
+  test_split_method: "by_block_of_20_consecutive_frames"   # closest to by_road; Attain has no road or location IDs. Also grouped 5-fold CV over the 43 blocks.
+  known_failure_modes:
+    - "Stage 1 calls 48% of Attain frames that carry annotated distress Normal (recall 51.8%), and Stage 2 then never runs. A probe safety net sends 313 of those 371 frames to review."
+    - "The free-form list collapses to 'Longitudinal Cracking, Transverse Cracking' (61% of Attain test frames). Longitudinal Cracking is listed first on 90% of frames that get a type."
+    - "Alligator cracking recall is 8%. Ravelling, weathering (Hungry Surface) and patches are never named on Attain frames that have them."
+    - "Shadows, wet surfaces and repair patches get called 'Bleeding' on Bengaluru close-ups: 52 of 204 uploads were labelled Bleeding, and the 4 we inspected showed no bitumen film. This is an inspection, not ground truth."
+    - "Severity is never 'High' on 847 Attain frames, although 368 of the 769 distressed frames carry a High annotation."
+    - "Imperceptible input changes flip labels: re-encoding as JPEG quality 95 changed the Stage 2 label set on 9 of 49 phone photos."
+    - "The Stage 2 confidence falls as more labels are named. It tracks over-prediction, not correctness."
+    - "When Stage 2 runs on a frame Stage 1 called Normal, the DISTRESS_TYPES value can be 'N/A' or 'None'. The parser returns these as the labels 'N/A' and 'Unknown'."
+    - "Concrete pavement has no labels; the taxonomy is bituminous only."
+    - "Lane markings, manholes, oil stains and joints are excluded only by prompt text. There is no measured false-positive rate because there are no annotated look-alike negatives."
+  tested_on_blur_or_compression: true   # JPEG q95/q75 and resolution caps down to 512x512: yes. Blur, motion blur, low light: no.
+ownership:
+  can_fine_tune: true          # QLoRA pipeline exists (LLaMA-Factory); a 43 h run on this A5000 has been done before
+  training_code_available: true
+  versioning_process: "Production config is pinned in the server .env (model, prompt version, quantization, pixel cap, probe config). Prompts are versioned by hash. Every model or prompt change must pass a smoke test and a per-class A/B on Attain before release. Probe changes follow pre-registered dev/test rules. Approver: [CONFIRM]."
+  technical_contact: ""        # [CONFIRM]

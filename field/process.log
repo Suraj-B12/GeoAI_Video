@@ -1,0 +1,15 @@
+2026-10-26 23:12:31,744 WARNING geoai: UTC fit slope deviates by -114.0 ppm from nominal
+2026-10-26 23:12:31,766 INFO geoai: trajectory: 310 m, latency 0.000 s (none), 0 gaps
+2026-10-26 23:12:31,790 WARNING geoai: usable road extent 1.69 m; band reduced to 1.02 m
+2026-10-26 23:12:31,790 INFO geoai: view 3840x2160: pitch 22.7 deg, height 1.35 m, band 1.46..2.49 m, analysis 2758x700
+2026-10-26 23:13:02,920 INFO geoai: bank: {(3840, 2160): 19} frames in 28.6 s
+2026-10-26 23:15:58,381 INFO geoai: query: 267 frames analysed, 548 raw records in 175.5 s
+2026-10-26 23:16:02,399 INFO geoai: done: {'sent': 474, 'duplicate': 74} in 210.8 s
+2026-10-26 23:16:02,903 INFO geoai: trajectory: 1150 m, latency 0.000 s (none), 0 gaps
+2026-10-26 23:16:02,933 WARNING geoai: usable road extent 1.71 m; band reduced to 1.04 m
+2026-10-26 23:16:02,933 INFO geoai: view 3840x2160: pitch 23.0 deg, height 1.35 m, band 1.45..2.48 m, analysis 2744x714
+2026-10-26 23:20:59,899 INFO geoai: bank: {(3840, 2160): 78} frames in 296.5 s
+2026-10-26 23:33:03,474 INFO geoai: query: 1109 frames analysed, 2736 raw records in 723.6 s
+2026-10-26 23:33:15,385 INFO geoai: done: {'sent': 2490, 'duplicate': 246} in 1033.0 s
+20261026T114907Z_SM-G991B-F0D1_293d: {'sent': 474, 'duplicate': 74}  (~3.7 h of VLM time)
+20261026T114332Z_SM-G991B-F0D1_f428: {'sent': 2490, 'duplicate': 246}  (~19.4 h of VLM time)

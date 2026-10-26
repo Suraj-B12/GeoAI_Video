@@ -1,0 +1,106 @@
+{
+  "name": "attain_dinov2_probe_v1",
+  "created_utc": "2026-10-22T14:08:38Z",
+  "training_data": "Attain v1 (doi:10.17632/nykrzdm74f.1), CC BY 4.0, all three subsets",
+  "features": {
+    "model": "dinov2_vits14_reg4",
+    "weights_sha256": "f433177089a681826f849f194ece3bb48f4d63fb38d32fc837e3dc7a4e5641fb",
+    "layers": [
+      4,
+      8
+    ],
+    "illum_sigma_px": 24.0,
+    "tile_patches": 32,
+    "tile_overlap_patches": 4,
+    "road_from": 0.45
+  },
+  "split": "blocks of 20 consecutive frames per subset (~70/15/15); VLM sample frames' blocks forced to test",
+  "C": 3.0,
+  "val_auroc": 0.8779883250909023,
+  "test_auroc": 0.8627354024989021,
+  "seed_rule": "1 % FPR on validation road patches",
+  "test_fpr_at_seed": 0.018363478987583573,
+  "test_lookalike_patch_fpr_at_seed": 0.031185165975103735,
+  "test_objects_flagged": {
+    "alligator": {
+      "objects": 937,
+      "flagged": 884,
+      "share": 0.9434364994663821,
+      "chance_share": 0.5190234283420708
+    },
+    "block": {
+      "objects": 31,
+      "flagged": 31,
+      "share": 1.0,
+      "chance_share": 0.9016476141932247
+    },
+    "dropoff": {
+      "objects": 129,
+      "flagged": 3,
+      "share": 0.023255813953488372,
+      "chance_share": 0.22187712620484754
+    },
+    "linear": {
+      "objects": 2013,
+      "flagged": 1718,
+      "share": 0.8534525583705912,
+      "chance_share": 0.30187522339270406
+    },
+    "manhole": {
+      "objects": 50,
+      "flagged": 35,
+      "share": 0.7,
+      "chance_share": 0.7203212061101507
+    },
+    "marking": {
+      "objects": 515,
+      "flagged": 143,
+      "share": 0.27766990291262134,
+      "chance_share": 0.4669763474163868
+    },
+    "patch": {
+      "objects": 179,
+      "flagged": 106,
+      "share": 0.5921787709497207,
+      "chance_share": 0.38820604884506277
+    },
+    "pothole": {
+      "objects": 99,
+      "flagged": 80,
+      "share": 0.8080808080808081,
+      "chance_share": 0.23878915053425806
+    },
+    "raveling": {
+      "objects": 165,
+      "flagged": 35,
+      "share": 0.21212121212121213,
+      "chance_share": 0.43592587738003274
+    },
+    "weathering": {
+      "objects": 1136,
+      "flagged": 826,
+      "share": 0.727112676056338,
+      "chance_share": 0.6418639470812525
+    }
+  },
+  "test_image_max_logit": {
+    "with_distress": {
+      "n": 588,
+      "median": 5.613403081893921,
+      "above_seed": 0.8537414965986394
+    },
+    "without_distress": {
+      "n": 89,
+      "median": 2.347226142883301,
+      "above_seed": 0.550561797752809
+    }
+  },
+  "n_patches": {
+    "train": 391461,
+    "val": 97416,
+    "test": 214148
+  },
+  "illum_sigma_px": 24.0,
+  "sha256": "6b3786b8cf85abca0d1a2adca1abc482d7b30be3bc6219b5d896b173afa263f1",
+  "chance_rule": "share expected if patch scores were random at the same test false-positive rate (1-(1-FPR)^patches)"
+}

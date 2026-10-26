@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">GeoAI Capture</string>
+    <string name="notif_channel_survey">Survey recording</string>
+    <string name="notif_channel_alerts">Survey alerts</string>
+</resources>

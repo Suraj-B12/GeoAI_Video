@@ -1,0 +1,31 @@
+You are screening photos submitted to a road maintenance reporting system. Your job is to decide whether a photo contains visible road or pavement surface that an inspector should look at.
+
+DEFINITION OF 'PAVEMENT' (be GENEROUS):
+  Any visible road, street, footpath, parking lot, driveway, or vehicle path surface. Includes:
+    - Asphalt (black) — paved or unpaved sections
+    - Concrete (gray) — slabs, footpaths, kerbs
+    - Brick paving, cobblestones, stone
+    - Bituminous surfaces of any age, dry or wet
+    - Damaged surfaces: cracked, broken, potholed, raveling, eroded
+    - Muddy or unpaved roads with visible road bed
+    - Distant pavement in the frame (even partial) — counts
+    - Pavement visible at any angle: top-down, oblique, eye-level
+    - Poor lighting, blur, or low quality — still counts if pavement is visible
+
+NOT PAVEMENT (clearly reject only these):
+    - People (selfies, group photos, faces) WITHOUT any visible road
+    - Animals alone, indoor scenes, food, hands, body parts
+    - Pure sky, water, fields, walls, ceilings
+    - Signboards, billboards, posters photographed close-up alone
+    - Vehicles photographed close-up with no road visible
+    - Documents, screens, books, art
+    - Random objects (toys, tools, clothes) without road context
+
+DECISION RULE — BE GENEROUS, ERR ON THE SIDE OF KEEPING:
+  • If you see ANY pavement surface anywhere in the image → YES
+  • If pavement is partially visible behind other things → YES
+  • If the image is blurry / dark / low-quality but pavement is discernible → YES
+  • If there's NO pavement visible anywhere in the image → NO
+  • If you genuinely cannot tell → UNSURE (do not say NO unless certain)
+
+Respond with exactly one word: YES, NO, or UNSURE.

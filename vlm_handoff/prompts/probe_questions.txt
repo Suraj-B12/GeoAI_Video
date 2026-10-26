@@ -1,0 +1,20 @@
+Bleeding	Bleeding	Does this road photo show Bleeding? Answer Yes or No.
+Streaking	Streaking	Does this road photo show Streaking? Answer Yes or No.
+Hungry Surface	Hungry Surface	Does this road photo show Hungry Surface? Answer Yes or No.
+Hairline Cracks	Hairline Cracks	Does this road photo show Hairline Cracks? Answer Yes or No.
+Alligator Cracking	Alligator Cracking	Does this road photo show Alligator Cracking? Answer Yes or No.
+Longitudinal Cracking	Longitudinal Cracking	Does this road photo show Longitudinal Cracking? Answer Yes or No.
+Transverse Cracking	Transverse Cracking	Does this road photo show Transverse Cracking? Answer Yes or No.
+Edge Cracking	Edge Cracking	Does this road photo show Edge Cracking? Answer Yes or No.
+Slippage	Slippage	Does this road photo show Slippage? Answer Yes or No.
+Rutting	Rutting	Does this road photo show Rutting? Answer Yes or No.
+Corrugation	Corrugation	Does this road photo show Corrugation? Answer Yes or No.
+Shoving	Shoving	Does this road photo show Shoving? Answer Yes or No.
+Shallow Depression	Shallow Depression	Does this road photo show Shallow Depression? Answer Yes or No.
+Settlement	Settlement	Does this road photo show Settlement? Answer Yes or No.
+Stripping	Stripping	Does this road photo show Stripping? Answer Yes or No.
+Ravelling	Ravelling	Does this road photo show Ravelling? Answer Yes or No.
+Potholes	Potholes	Does this road photo show Potholes? Answer Yes or No.
+Edge Breaking	Edge Breaking	Does this road photo show Edge Breaking? Answer Yes or No.
+Patching	Patching	Does this road photo show Patching? Answer Yes or No.
+Block Cracking	Transverse Cracking	Does this road photo show Block Cracking? Answer Yes or No.
