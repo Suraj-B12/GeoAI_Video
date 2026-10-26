@@ -48,3 +48,19 @@ def test_nullable_session_timestamps_keep_nanosecond_precision(tmp_path):
     assert int(rows.loc[0, "t_ns"]) == ns
     assert pd.isna(rows.loc[1, "t_ns"])
     assert int(rows.loc[2, "t_ns"]) == ns + 1
+
+
+@pytest.mark.parametrize("has_frames", [False, True])
+def test_invalid_session_does_not_destroy_previous_run(tmp_path, has_frames):
+    source = tmp_path / "sessions" / "S"
+    source.mkdir(parents=True)
+    (source / "session.json").write_text(json.dumps({"spec_version": "1.1", "session_id": "S"}))
+    if has_frames:
+        (source / "frames.csv").write_text("segment,frame_in_segment,frame_global,t_ns\n0,0,0,1000000000\n")
+    previous = tmp_path / "runs" / "S"
+    previous.mkdir(parents=True)
+    result = previous / "report.json"
+    result.write_text('{"previous": "successful"}')
+    with pytest.raises((ValueError, ExtractionError)):
+        process_session(source, previous.parent, Config())
+    assert result.read_text() == '{"previous": "successful"}'

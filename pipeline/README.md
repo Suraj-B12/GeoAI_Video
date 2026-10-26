@@ -36,7 +36,8 @@ python ../tools/pull_sessions.py D:/geoai/sessions
 python -m geoai process D:/geoai/sessions/<session_id> --out D:/geoai/runs
 ```
 Keep the output directory separate from the source sessions: rerunning a session replaces its
-existing run. Source/output overlap is rejected before any files are removed.
+existing run after the inputs, geometry, model and reference bank have been validated.
+Source/output overlap is rejected before any files are removed.
 ```bash
 python -m geoai vlm-export D:/geoai/runs/<session_id> --batch E:/vlm_batch_001
 ```

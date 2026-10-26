@@ -209,11 +209,8 @@ def process_session(session_dir: Path, out_root: Path, cfg: Config, *, allow_tes
     target = out.resolve()
     if source == target or source.is_relative_to(target) or target.is_relative_to(source):
         raise ExtractionError("output directory must not overlap the source session")
-    if out.exists():
-        shutil.rmtree(out)
-    (out / "crops").mkdir(parents=True)
-    (out / "frames").mkdir()
-    (out / "sidecars").mkdir()
+    if s.frames.empty:
+        raise ExtractionError("session has no usable frame metadata")
 
     # Time and trajectory.
     t0 = s.t0_ns
@@ -314,6 +311,12 @@ def process_session(session_dir: Path, out_root: Path, cfg: Config, *, allow_tes
     log.info("bank: %s frames in %.1f s", bank_counts, time.time() - t_bank)
 
     # Pass 2: query.
+    # Keep a previous run intact until the inputs, geometry, model and reference bank are usable.
+    if out.exists():
+        shutil.rmtree(out)
+    (out / "crops").mkdir(parents=True)
+    (out / "frames").mkdir()
+    (out / "sidecars").mkdir()
     t_query = time.time()
     lat0 = traj.origin
     tz = cfg.output.utc_offset_minutes

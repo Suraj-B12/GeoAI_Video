@@ -9,6 +9,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.security.MessageDigest
 
 /**
@@ -102,26 +103,40 @@ class SessionStore(private val context: Context) {
         ManifestBuilder.write(dir, session.optString("session_id", dir.name), progress)
     }
 
-    /** Last t_ns in frames.csv/imu.csv, so a recovered session still gets a plausible end time. */
-    private fun lastLoggedTimestamp(dir: File): Long? {
-        for (name in listOf("frames.csv", "imu.csv", "gnss_fixes.csv")) {
-            val f = File(dir, name)
-            if (!f.isFile || f.length() == 0L) continue
-            val lines = f.readLines().filter { it.isNotBlank() }
-            if (lines.size < 2) continue
-            val header = lines.first().split(',')
-            val idx = header.indexOf("t_ns")
-            if (idx < 0) continue
-            for (line in lines.asReversed()) {
-                val v = line.split(',').getOrNull(idx)?.toLongOrNull()
-                if (v != null) return v
-            }
-        }
-        return null
-    }
-
     companion object {
         fun readJson(f: File): JSONObject? = runCatching { JSONObject(f.readText()) }.getOrNull()
+
+        /** Last complete t_ns row; stream long recordings without loading millions of lines. */
+        internal fun lastLoggedTimestamp(dir: File): Long? {
+            for (name in listOf("frames.csv", "imu.csv", "gnss_fixes.csv")) {
+                val file = File(dir, name)
+                if (!file.isFile || file.length() == 0L) continue
+                val completeTail = RandomAccessFile(file, "r").use {
+                    it.seek(it.length() - 1)
+                    it.read() == '\n'.code
+                }
+                val last = file.bufferedReader().use { reader ->
+                    val header = reader.readLine()?.split(',') ?: return@use null
+                    val idx = header.indexOf("t_ns")
+                    if (idx < 0) return@use null
+                    var timestamp: Long? = null
+                    var line = reader.readLine()
+                    while (line != null) {
+                        val next = reader.readLine()
+                        if (next != null || completeTail) {
+                            val fields = line.split(',')
+                            if (fields.size == header.size) {
+                                fields[idx].toLongOrNull()?.let { timestamp = it }
+                            }
+                        }
+                        line = next
+                    }
+                    timestamp
+                }
+                if (last != null) return last
+            }
+            return null
+        }
 
         /** Write to a temp file, fsync, then rename, so a crash never leaves half a JSON file. */
         fun writeJsonAtomic(target: File, json: JSONObject) {
