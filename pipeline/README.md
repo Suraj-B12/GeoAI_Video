@@ -35,6 +35,8 @@ python ../tools/pull_sessions.py D:/geoai/sessions
 ```bash
 python -m geoai process D:/geoai/sessions/<session_id> --out D:/geoai/runs
 ```
+Keep the output directory separate from the source sessions: rerunning a session replaces its
+existing run. Source/output overlap is rejected before any files are removed.
 ```bash
 python -m geoai vlm-export D:/geoai/runs/<session_id> --batch E:/vlm_batch_001
 ```
@@ -114,9 +116,12 @@ python -m pytest -m "not slow"
 ```bash
 python -m pytest -m slow
 ```
-- The fast suite has 59 tests and runs in about 2 minutes.
+- The fast suite covers geometry, trajectory, crop sizing, transfer verification, duplicate handling,
+  PNG writing and the resumable VLM hand-off.
 - The slow suite (9 tests) is end to end on simulated sessions, including a GNSS outage and a run with the probe on, and takes about 5 minutes on a CPU.
 - Set `GEOAI_EMULATOR_SESSION=<folder>` to also run the video-join tests on a real app recording.
+- CUDA comparisons require a CUDA device. The held-out photograph test is skipped when the
+  sample images are absent (images are excluded from Git); probe metadata and feature checks still run.
 
 The simulator (`python -m geoai simulate OUT`) writes a complete session package (spec v1.1) with known distresses, lane markings, a shadow, 1 Hz GNSS with noise and latency, a rolling shutter and H.264 fragmented MP4. `python -m geoai evaluate RUN truth.json` scores a run against it.
 

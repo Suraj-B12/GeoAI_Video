@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pytest
 
 from geoai.config import GeometryConfig
 from geoai.geometry import CameraModel, cam_from_device, intrinsics_from_camera_meta, nominal_model, vehicle_from_camera
@@ -72,6 +73,17 @@ def test_gravity_of_spec_example_gives_45_degree_pitch():
     assert abs(m.pitch_deg - 45.0) < 0.1
     assert abs(m.roll_deg) < 1.0
     assert m.height_m == 1.6 and m.source == "nominal"
+
+
+@pytest.mark.parametrize("metadata", [
+    {"camera": {"sensor_orientation_deg": 0}, "orientation": {"sensor_orientation_deg": 90}},
+    {"orientation": {"sensor_orientation_deg": 0}},
+])
+def test_zero_degree_sensor_orientation_is_not_replaced_by_default(metadata):
+    m = nominal_model(metadata, 3840, 2160, np.array([0.0, 6.9, 6.9]), GeometryConfig())
+    assert m.notes["sensor_orientation_deg"] == 0
+    assert abs(m.pitch_deg - 45.0) < 1e-9
+    assert abs(m.roll_deg) < 1e-9
 
 
 def test_cam_from_device_is_a_rotation():

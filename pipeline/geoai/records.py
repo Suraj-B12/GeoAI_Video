@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -139,35 +140,44 @@ class PngPool:
     """Writes PNGs on worker threads; zlib releases the GIL, so encoding runs in parallel with detection.
 
     The image and the record are copied at submit time, so later changes to either don't reach the file
-    and the output is the same as writing in order. `drain()` waits for every file and runs the callbacks
-    (in submit order) with each file's SHA-256.
+    and the output is the same as writing in order. Completed jobs and their callbacks are released
+    in submit order as new work arrives; `drain()` waits for any remaining jobs. The queue is bounded
+    so long surveys do not retain every completed Future or rescan them on every image.
     """
 
     def __init__(self, workers: int | None = None, max_pending: int = 64):
         self._ex = ThreadPoolExecutor(workers or min(8, os.cpu_count() or 4), thread_name_prefix="png")
-        self._jobs: list[tuple[Future, object]] = []
-        self._max_pending = max_pending
+        self._jobs: deque[tuple[Future, object]] = deque()
+        self._max_pending = max(1, max_pending)
 
     def submit(self, path: Path, rgb: np.ndarray, rec: dict | None, on_done=None, **kwargs) -> None:
         img = np.array(rgb, dtype=np.uint8, copy=True, order="C")
         rec_copy = json.loads(to_json(rec, indent=None)) if rec is not None else None
         self._jobs.append((self._ex.submit(write_png, path, img, rec_copy, **kwargs), on_done))
-        pending = [f for f, _ in self._jobs if not f.done()]
-        if len(pending) > self._max_pending:
-            pending[0].result()  # bound the memory held by queued images
+        while self._jobs and (self._jobs[0][0].done() or len(self._jobs) > self._max_pending):
+            self._finish_one()
+
+    def _finish_one(self) -> None:
+        fut, cb = self._jobs.popleft()
+        sha = fut.result()
+        if cb is not None:
+            cb(sha)
 
     def drain(self) -> None:
-        jobs, self._jobs = self._jobs, []
-        for fut, cb in jobs:
-            sha = fut.result()
-            if cb is not None:
-                cb(sha)
+        while self._jobs:
+            self._finish_one()
 
     def close(self) -> None:
         try:
             self.drain()
         finally:
             self._ex.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
 
 
 def read_png_record(path: Path) -> tuple[dict | None, dict]:

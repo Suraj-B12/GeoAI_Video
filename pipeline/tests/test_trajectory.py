@@ -117,6 +117,17 @@ def test_latency_falls_back_to_default_on_short_session():
     assert est.method == "device_default" and est.latency_s == 0.08
 
 
+@pytest.mark.parametrize("sensor", ["acc", "gravity", "gyro"])
+def test_missing_sensor_values_fall_back_without_crashing(sensor):
+    df, imu = _straight_drive(duration=40.0)
+    imu.loc[imu["sensor"] == sensor, ["x", "y", "z"]] = np.nan
+    cfg = GnssConfig(default_latency_s=0.08, default_latency_measured=True)
+    trajectory = build_trajectory(clean_fixes(df, T0_NS, cfg), imu, T0_NS, cfg)
+    assert trajectory.latency.method == "device_default"
+    assert trajectory.latency.latency_s == 0.08
+    assert np.isfinite(trajectory.heading).all()
+
+
 def _three_point_turn():
     """Forward north 20 s, stop, reverse south 8 s (body still facing north), stop, forward again."""
     fs = 200.0

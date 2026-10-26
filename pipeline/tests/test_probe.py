@@ -49,10 +49,14 @@ def _road(path):
 
 
 def test_flags_held_out_distress_frames_more_than_clean_ones():
+    samples = sorted(SAMPLES.glob("0[1-8]_*/*.png"))
+    required = {"01_linear_crack", "02_alligator_crack", "07_block_crack", "08_no_distress_annotated"}
+    if not required.issubset({f.parent.name for f in samples}):
+        pytest.skip("held-out sample images are not included in this checkout")
     p = DistressProbe.load(PROBE)
     pf = PatchFeatures(Path(CFG.weights), "cpu", layers=CFG.layers)
     frac = {}
-    for f in sorted(SAMPLES.glob("0[1-8]_*/*.png")):
+    for f in samples:
         logit = p.logits(pf(normalise_illumination(_road(f), CFG.illum_sigma_px)))
         frac.setdefault(f.parent.name, []).append(float((logit >= p.seed_logit).mean()))
     cracks = [v for k, vs in frac.items() for v in vs if k in ("01_linear_crack", "02_alligator_crack", "07_block_crack")]
