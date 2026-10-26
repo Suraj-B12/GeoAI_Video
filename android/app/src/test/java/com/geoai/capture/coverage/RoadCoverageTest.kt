@@ -124,6 +124,21 @@ class RoadCoverageTest {
         assertTrue("new ${again.newM}", again.newM < 10)
     }
 
+    @Test fun storeRepairsTornCellBeforeAppending() {
+        val root = tmp.newFolder("torn")
+        val store = CoverageStore(root)
+        val first = 0x0123456789abcdefL
+        val second = 0x1020304050607080L
+        store.commit("first", 4.0, listOf(first))
+        val cells = File(root, "coverage/cells.bin")
+        cells.appendBytes(byteArrayOf(0x12, 0x34, 0x56))
+        assertEquals(setOf(first), store.loadCells())
+        store.commit("second", 4.0, listOf(second))
+        assertEquals(setOf(first, second), store.loadCells())
+        assertEquals(16L, cells.length())
+        assertEquals(8.0, store.totalNewM(), 0.0)
+    }
+
     /** The pilot's real S21 sessions, when present in the repo (`field/sessions`). Prints the figures. */
     @Test fun realSessions() {
         val dir = File("../../field/sessions")

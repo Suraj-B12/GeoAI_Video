@@ -77,14 +77,37 @@ def answered(resp_path: Path) -> set:
     if not resp_path.exists():
         return done
     lines = resp_path.read_text(encoding="utf-8").splitlines()
-    for i, line in enumerate(lines):
+    for line in lines:
         try:
             r = json.loads(line)
         except ValueError:
             continue  # a half-written last line after an interruption
-        if not r.get("error"):
+        if (isinstance(r, dict) and not r.get("error") and r.get("http_status") == 200
+                and isinstance(r.get("response"), dict) and isinstance(r.get("request_id"), str)):
             done.add(r["request_id"])
     return done
+
+
+def repair_response_tail(resp_path: Path) -> None:
+    """Remove only a torn final record before appending, preserving complete JSON without a newline."""
+    if not resp_path.exists():
+        return
+    data = resp_path.read_bytes()
+    if not data or data.endswith(b"\n"):
+        return
+    end = data.rfind(b"\n") + 1
+    try:
+        json.loads(data[end:])
+    except (ValueError, UnicodeDecodeError):
+        with resp_path.open("r+b") as out:
+            out.truncate(end)
+            out.flush()
+            os.fsync(out.fileno())
+    else:
+        with resp_path.open("ab") as out:
+            out.write(b"\n")
+            out.flush()
+            os.fsync(out.fileno())
 
 
 def main() -> int:
@@ -116,6 +139,7 @@ def main() -> int:
 
     reqs = [json.loads(l) for l in (d / "requests.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
     resp_path = d / "responses.jsonl"
+    repair_response_tail(resp_path)
     done = answered(resp_path)
     todo = [r for r in reqs if r["request_id"] not in done]
     print(f"{len(reqs)} requests, {len(done)} already answered, {len(todo)} to send")
@@ -133,10 +157,10 @@ def main() -> int:
             else:
                 body, ctype = multipart(img)
                 for attempt in range(6):
-                    wait = a.min_interval - (time.time() - last_start)
+                    wait = a.min_interval - (time.monotonic() - last_start)
                     if wait > 0:
                         time.sleep(wait)
-                    last_start = time.time()
+                    last_start = time.monotonic()
                     rec["started_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                     try:
                         status, resp = _request(a.url.rstrip("/") + "/classify", body,
@@ -145,14 +169,17 @@ def main() -> int:
                         status, resp = None, None
                         rec["error"] = repr(e)
                         break
-                    if status == 429:  # rate limited: back off and retry
-                        time.sleep(10 * (attempt + 1))
-                        continue
                     rec["http_status"] = status
                     rec["response"] = resp
                     rec["error"] = None if status == 200 else f"HTTP {status}"
+                    if status == 429:  # keep the failure if all retries are exhausted
+                        if attempt < 5:
+                            time.sleep(10 * (attempt + 1))
+                        continue
+                    if status == 200 and not isinstance(resp, dict):
+                        rec["error"] = "classifier response is not a JSON object"
                     break
-                rec["seconds"] = round(time.time() - last_start, 3)
+                rec["seconds"] = round(time.monotonic() - last_start, 3)
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             out.flush()
             os.fsync(out.fileno())

@@ -164,6 +164,8 @@ def _imu_axes(imu: pd.DataFrame, sensor: str, t0_ns: int):
     if d.empty:
         return None, None
     d = d.dropna(subset=["t_ns", "x", "y", "z"]).sort_values("t_ns")
+    if d.empty:
+        return None, None
     t = (d["t_ns"].to_numpy(dtype=np.int64) - np.int64(t0_ns)) / 1e9
     v = d[["x", "y", "z"]].to_numpy(float)
     keep = np.concatenate([[True], np.diff(t) > 0])

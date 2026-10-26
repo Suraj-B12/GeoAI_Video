@@ -1,5 +1,6 @@
 package com.geoai.capture.io
 
+import com.geoai.capture.util.Diag
 import java.io.BufferedOutputStream
 import java.io.Closeable
 import java.io.File
@@ -34,15 +35,26 @@ class IoScheduler(private val syncEveryMs: Long = 5_000) {
         val sync = now - lastSyncMs >= syncEveryMs
         if (sync) lastSyncMs = now
         val snapshot = synchronized(this) { writers.toList() }
-        for (w in snapshot) w.drain(sync)
+        for (w in snapshot) {
+            // An exception escaping a scheduled task cancels every future execution. Keep
+            // other session logs draining and allow transient storage failures to be retried.
+            try {
+                w.drain(sync)
+            } catch (e: Exception) {
+                Diag.e("log flush failed: ${w.file.name}", e)
+            }
+        }
     }
 
     /** Final drain + fsync + close, executed on the I/O thread; blocks the caller until done. */
     internal fun close(w: AsyncLineWriter) {
         exec.submit {
-            w.drain(true)
-            w.closeStream()
-            synchronized(this) { writers -= w }
+            try {
+                w.drain(true)
+            } finally {
+                w.closeStream()
+                synchronized(this) { writers -= w }
+            }
         }.get(10, TimeUnit.SECONDS)
     }
 
@@ -66,7 +78,7 @@ class AsyncLineWriter(val file: File, header: String?, private val io: IoSchedul
         io.register(this)
     }
 
-    fun write(line: String) {
+    @Synchronized fun write(line: String) {
         if (!closed) queue.add(line)
     }
 
@@ -92,8 +104,10 @@ class AsyncLineWriter(val file: File, header: String?, private val io: IoSchedul
     }
 
     override fun close() {
-        if (closed) return
-        closed = true
+        synchronized(this) {
+            if (closed) return
+            closed = true
+        }
         io.close(this)
     }
 }

@@ -235,7 +235,10 @@ def nominal_model(meta: dict, width: int, height: int, gravity_device: np.ndarra
     cam = meta.get("camera", {}) or {}
     mount = meta.get("mount", {}) or {}
     K, dist, k_src = intrinsics_from_camera_meta(cam, width, height, cfg.default_hfov_deg)
-    so = int(cam.get("sensor_orientation_deg") or (meta.get("orientation") or {}).get("sensor_orientation_deg") or 90)
+    so = cam.get("sensor_orientation_deg")
+    if so is None:
+        so = (meta.get("orientation") or {}).get("sensor_orientation_deg")
+    so = 90 if so is None else int(so)
     up_cam = cam_from_device(so) @ (np.asarray(gravity_device, float) / np.linalg.norm(gravity_device))
     facing = str(mount.get("camera_facing") or "forward")
     R = vehicle_from_camera(up_cam, facing)

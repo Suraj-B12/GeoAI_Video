@@ -15,6 +15,7 @@ import argparse
 import base64
 import csv
 import hashlib
+import io
 import json
 import shutil
 import statistics
@@ -67,10 +68,10 @@ def read_csv(p: Path) -> list[dict]:
     """Reads a session CSV, dropping an incomplete last line (allowed after a crash)."""
     if not p.is_file():
         return []
-    text = p.read_text(encoding="utf-8")
-    if text and not text.endswith("\n"):
-        text = text[: text.rfind("\n") + 1]
-    return list(csv.DictReader(text.splitlines()))
+    data = p.read_bytes()
+    if data and not data.endswith(b"\n"):
+        data = data[: data.rfind(b"\n") + 1]
+    return list(csv.DictReader(io.StringIO(data.decode("utf-8"))))
 
 
 def to_int(v):
@@ -92,8 +93,28 @@ def check_manifest(d: Path, r: Report) -> None:
     if not mpath.is_file():
         r.fail("manifest", "manifest.json missing (session not finalised; finalise it in the app)")
         return
-    m = json.loads(mpath.read_text(encoding="utf-8"))
-    listed = {f["path"]: f for f in m.get("files", [])}
+    try:
+        m = json.loads(mpath.read_text(encoding="utf-8"))
+        if not isinstance(m, dict) or not isinstance(m.get("files"), list) or not m["files"]:
+            raise ValueError("manifest must contain a non-empty files list")
+        listed = {}
+        root = d.resolve()
+        for f in m["files"]:
+            if not isinstance(f, dict):
+                raise ValueError("invalid file entry")
+            rel = f["path"]
+            if (not isinstance(rel, str) or not rel or "\\" in rel or ":" in rel
+                    or Path(rel).is_absolute() or ".." in Path(rel).parts
+                    or not (d / rel).resolve().is_relative_to(root)):
+                raise ValueError("file path leaves session or is invalid")
+            if rel in listed:
+                raise ValueError(f"duplicate file entry: {rel}")
+            if not isinstance(f.get("bytes"), int) or not isinstance(f.get("sha256"), str):
+                raise ValueError(f"invalid size or checksum: {rel}")
+            listed[rel] = f
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        r.fail("manifest", f"invalid or unreadable: {e}")
+        return
     bad = []
     for rel, f in listed.items():
         p = d / rel
@@ -116,7 +137,6 @@ def check_manifest(d: Path, r: Report) -> None:
     if not sig:
         r.warn("signature", f"absent ({m.get('signature_error', 'no reason given')})")
         return
-    payload = {k: m[k] for k in ("spec_version", "session_id", "created_wall_ms", "files")}
     try:
         from cryptography.exceptions import InvalidSignature
         from cryptography.hazmat.primitives import hashes, serialization
@@ -125,11 +145,14 @@ def check_manifest(d: Path, r: Report) -> None:
         r.info("signature", "present; install `cryptography` to verify it")
         return
     try:
+        payload = {k: m[k] for k in ("spec_version", "session_id", "created_wall_ms", "files")}
         key = serialization.load_der_public_key(base64.b64decode(sig["public_key_x509_b64"]))
         key.verify(base64.b64decode(sig["value_b64"]), canonical(payload), ec.ECDSA(hashes.SHA256()))
         r.ok("signature", "ECDSA P-256 signature valid for the manifest payload")
     except InvalidSignature:
         r.fail("signature", "INVALID: manifest was modified after signing")
+    except Exception as e:  # malformed signature/key, not a valid signed manifest
+        r.fail("signature", f"invalid signature data: {e.__class__.__name__}")
 
 
 def ffprobe_packets(video: Path):
@@ -168,7 +191,6 @@ def check_video(d: Path, frames: list[dict], r: Report) -> None:
             r.fail(f"{seg.name}", f"ffprobe failed: {e}")
             continue
         name = f"{seg.name} ({stream.get('codec_name')} {stream.get('width')}x{stream.get('height')})"
-        pkts.sort(key=lambda p: int(p["pts"]))
         if len(pkts) != len(rows):
             # The last fragment of a crashed session may be lost: fewer packets than rows is a WARN.
             level = r.warn if len(pkts) < len(rows) else r.fail
@@ -218,7 +240,8 @@ def check_frames(frames: list[dict], r: Report) -> tuple[int | None, int | None]
         drops = [g for g in gaps if g > 1.5 * med]
         pct = 100.0 * len(drops) / len(gaps)
         (r.ok if pct < 0.1 else r.warn)("dropped frames", f"{len(drops)} gaps > 1.5x median ({med / 1e6:.2f} ms); {pct:.2f}%")
-        r.info("frame rate", f"{1e9 / med:.2f} fps median")
+        if med > 0:
+            r.info("frame rate", f"{1e9 / med:.2f} fps median")
     exp = [to_int(f["exposure_ns"]) for f in frames if to_int(f["exposure_ns"])]
     if exp:
         r.info("exposure", f"median 1/{1e9 / statistics.median(exp):.0f} s, longest 1/{1e9 / max(exp):.0f} s")
@@ -297,10 +320,28 @@ def main() -> int:
     r = Report()
     try:
         session = json.loads((d / "session.json").read_text(encoding="utf-8"))
+        if not isinstance(session, dict):
+            raise ValueError("metadata must be a JSON object")
     except Exception as e:  # noqa: BLE001
         print(f"cannot read session.json: {e}", file=sys.stderr)
         return 2
-    major = int(str(session.get("spec_version", "0")).split(".")[0])
+    def section(name):
+        value = session.get(name)
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            r.fail(f"session.{name}", "must be a JSON object")
+            return {}
+        return value
+
+    def check(name, fn, *args):
+        try:
+            return fn(*args, r)
+        except (OSError, ValueError, TypeError, KeyError, IndexError) as e:
+            r.fail(name, f"invalid or unreadable data: {e}")
+            return None
+
+    major = to_int(str(session.get("spec_version", "0")).split(".")[0])
     (r.ok if major == SUPPORTED_MAJOR else r.fail)("spec_version", str(session.get("spec_version")))
     bs, be = session.get("boot_count_start"), session.get("boot_count_end")
     if be is None:
@@ -309,25 +350,29 @@ def main() -> int:
         r.fail("boot count", f"phone rebooted during the session ({bs} -> {be})")
     else:
         r.ok("boot count", "no reboot during the session")
-    end = session.get("end", {})
+    end = section("end")
     r.info("session", f"{session.get('session_id')} type={session.get('session_type')} end={end.get('reason')}")
-    cam = session.get("camera", {})
+    cam = section("camera")
     ts = cam.get("timestamp_source")
     (r.ok if ts == "REALTIME" else r.warn)("camera timestamp source", str(ts))
-    cs = session.get("capture_settings", {})
+    cs = section("capture_settings")
     mode = cs.get("exposure_mode")
     (r.ok if mode == "MANUAL_SHUTTER_AUTO_ISO" else r.warn)("exposure mode", str(mode))
     r.info("streams", f"{cs.get('streams_while_recording')} timestamp base {cs.get('encoder_timestamp_base')}")
-    orient = session.get("orientation", {}).get("verdict")
+    orient = section("orientation").get("verdict")
     (r.ok if orient == "UPRIGHT" else r.warn)("mount orientation", str(orient))
 
-    check_manifest(d, r)
-    frames = read_csv(d / "frames.csv")
-    check_video(d, frames, r)
-    t0, t1 = check_frames(frames, r)
-    check_gnss(d, t0, t1, r)
-    check_imu(d, r)
-    check_clock(d, r)
+    check("manifest", check_manifest, d)
+    try:
+        frames = read_csv(d / "frames.csv")
+    except (OSError, ValueError, csv.Error) as e:
+        r.fail("frames.csv", f"unreadable: {e}")
+        frames = []
+    check("video", check_video, d, frames)
+    t0, t1 = check("frames.csv", check_frames, frames) or (None, None)
+    check("gnss", check_gnss, d, t0, t1)
+    check("imu", check_imu, d)
+    check("clock", check_clock, d)
 
     width = max(len(i["check"]) for i in r.items)
     for i in r.items:

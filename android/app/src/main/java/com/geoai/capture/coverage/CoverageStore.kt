@@ -44,7 +44,17 @@ class CoverageStore(dir: File) {
     fun commit(sessionId: String, newM: Double, cells: List<Long>) {
         dir.mkdirs()
         if (cells.isNotEmpty()) {
-            DataOutputStream(FileOutputStream(cellsFile, true).buffered()).use { s -> cells.forEach { s.writeLong(it) } }
+            FileOutputStream(cellsFile, true).use { file ->
+                // loadCells ignores a torn final Long. Remove those bytes before appending,
+                // otherwise every subsequent cell is read at the wrong eight-byte boundary.
+                val size = file.channel.size()
+                file.channel.truncate(size - size % Long.SIZE_BYTES)
+                DataOutputStream(file.buffered()).use { s ->
+                    cells.forEach { s.writeLong(it) }
+                    s.flush()
+                    file.fd.sync()
+                }
+            }
         }
         val all = sessions().toMutableMap()
         all[sessionId] = newM

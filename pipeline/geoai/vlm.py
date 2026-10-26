@@ -141,6 +141,8 @@ def _labels(resp: dict) -> list[str]:
         return []
     if isinstance(v, str):
         v = [x.strip() for x in v.split(",") if x.strip()]
+    if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
+        return []
     out = []
     for x in v:
         x = str(x).strip()
@@ -178,17 +180,24 @@ def import_batch(batch_dir: Path, run_dirs: list[Path], cfg: Config) -> dict:
                 continue  # half-written last line after an interruption
             problems["bad_json"] += 1
             continue
+        if not isinstance(r, dict):
+            problems["bad_json"] += 1
+            continue
         rid = r.get("request_id")
-        if rid not in reqs:
+        if not isinstance(rid, str) or rid not in reqs:
             problems["unknown_request"] += 1
             continue
         if r.get("error"):
             continue  # not classified; will be re-sent
         res = _parse(r, reqs[rid], allowed)
-        if rid in results and results[rid]["labels"] != res["labels"]:
-            problems["duplicate_conflict"] += 1
-            res["valid"] = False
-            res["problem"] = "conflicting duplicate responses"
+        if rid in results:
+            previous = results[rid]
+            conflict = previous["labels"] != res["labels"]
+            if conflict:
+                problems["duplicate_conflict"] += 1
+            if conflict or previous["problem"] == "conflicting duplicate responses":
+                res["valid"] = False
+                res["problem"] = "conflicting duplicate responses"
         results[rid] = res
     # Crop vs its full frame (the VLM team's week-1 comparison).
     for res in results.values():
@@ -220,6 +229,8 @@ def import_batch(batch_dir: Path, run_dirs: list[Path], cfg: Config) -> dict:
 
 def _parse(r: dict, req: dict, allowed: set[str]) -> dict:
     resp = r.get("response") or {}
+    if not isinstance(resp, dict):
+        resp = {}
     labels = _labels(resp)
     problem = ""
     if not labels:

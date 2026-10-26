@@ -64,6 +64,7 @@ def iter_segment(path: Path, rows: pd.DataFrame, *, segment: int, keyframes_only
     index_of_pts: dict[int, int] = {}
     n_samples = 0
     seen = 0
+    last_pts = None
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         stream.thread_type = threads
@@ -73,6 +74,9 @@ def iter_segment(path: Path, rows: pd.DataFrame, *, segment: int, keyframes_only
             if packet.pts is not None:
                 if packet.pts in index_of_pts:
                     raise JoinError(f"segment {segment}: duplicate container PTS {packet.pts}")
+                if last_pts is not None and packet.pts <= last_pts:
+                    raise JoinError(f"segment {segment}: container PTS not strictly increasing (B-frames/reordering)")
+                last_pts = packet.pts
                 index_of_pts[packet.pts] = n_samples
                 n_samples += 1
             for frame in packet.decode():

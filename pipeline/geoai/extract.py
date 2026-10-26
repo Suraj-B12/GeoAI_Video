@@ -200,12 +200,17 @@ def process_session(session_dir: Path, out_root: Path, cfg: Config, *, allow_tes
     if verdict == "PORTRAIT":
         raise ExtractionError("phone was mounted in portrait: camera geometry unusable")
     rotate180 = verdict == "UPSIDE_DOWN"
+    # The output is replaced on reruns. Reject ambiguous IDs and source/output overlap before
+    # removing anything, including when either path reaches the source through a symlink.
+    if s.session_id in ("", ".", "..") or any(c in s.session_id for c in "/\\:"):
+        raise ExtractionError("session_id must be a single folder name")
     out = Path(out_root) / s.session_id
-    if out.exists():
-        shutil.rmtree(out)
-    (out / "crops").mkdir(parents=True)
-    (out / "frames").mkdir()
-    (out / "sidecars").mkdir()
+    source = Path(session_dir).resolve()
+    target = out.resolve()
+    if source == target or source.is_relative_to(target) or target.is_relative_to(source):
+        raise ExtractionError("output directory must not overlap the source session")
+    if s.frames.empty:
+        raise ExtractionError("session has no usable frame metadata")
 
     # Time and trajectory.
     t0 = s.t0_ns
@@ -306,6 +311,12 @@ def process_session(session_dir: Path, out_root: Path, cfg: Config, *, allow_tes
     log.info("bank: %s frames in %.1f s", bank_counts, time.time() - t_bank)
 
     # Pass 2: query.
+    # Keep a previous run intact until the inputs, geometry, model and reference bank are usable.
+    if out.exists():
+        shutil.rmtree(out)
+    (out / "crops").mkdir(parents=True)
+    (out / "frames").mkdir()
+    (out / "sidecars").mkdir()
     t_query = time.time()
     lat0 = traj.origin
     tz = cfg.output.utc_offset_minutes
@@ -315,59 +326,59 @@ def process_session(session_dir: Path, out_root: Path, cfg: Config, *, allow_tes
     next_q = -math.inf
     selected = 0
     frame_stats = []
-    pool = PngPool()
-    for seg, path in seg_files.items():
-        res = seg_res[seg]
-        v = views[res]
-        det = detectors[res]
-        clock = _RowClock(t0, v.height, v.rotate180)
-        sel_info: dict[int, tuple] = {}
+    with PngPool() as pool:
+        for seg, path in seg_files.items():
+            res = seg_res[seg]
+            v = views[res]
+            det = detectors[res]
+            clock = _RowClock(t0, v.height, v.rotate180)
+            sel_info: dict[int, tuple] = {}
 
-        def want(idx, row, v=v, clock=clock, sel_info=sel_info):
-            nonlocal next_q
-            ok = frame_ok(row, clock, v)
-            if ok is None:
-                return False
-            s_m = float(ok[1]["s"][0])
-            if s_m < next_q:
-                return False
-            # Next target on a 1.5 m grid; after a gap (already past the next target) restart the
-            # grid one band ahead, instead of selecting the very next frame too.
-            next_q = next_q + v.band_len if s_m < next_q + v.band_len else s_m + v.band_len
-            sel_info[idx] = (ok[0], s_m)
-            return True
+            def want(idx, row, v=v, clock=clock, sel_info=sel_info):
+                nonlocal next_q
+                ok = frame_ok(row, clock, v)
+                if ok is None:
+                    return False
+                s_m = float(ok[1]["s"][0])
+                if s_m < next_q:
+                    return False
+                # Next target on a 1.5 m grid; after a gap (already past the next target) restart the
+                # grid one band ahead, instead of selecting the very next frame too.
+                next_q = next_q + v.band_len if s_m < next_q + v.band_len else s_m + v.band_len
+                sel_info[idx] = (ok[0], s_m)
+                return True
 
-        rows = s.frames[s.frames["segment"] == seg]
-        for fr in iter_segment(path, rows, segment=seg, rotate180=rotate180, want=want, allow_extra_rows=True):
-            if fr.rgb is None:
-                continue
-            selected += 1
-            t_mid, s_anchor = sel_info.pop(fr.index)
-            ana = v.analysis_image(fr.rgb)
-            cands, diag = det.detect(ana, s_anchor, v.gsd_rows_mm)
-            frame_stats.append({"frame_global": int(fr.row["frame_global"]), "s_m": s_anchor, **diag,
-                                "candidates": len(cands), "band_len": v.band_len})
-            frame_recs = _frame_records(fr, v, cands, t_mid, s_anchor, traj, s, cfg, clock, frame_order)
-            if frame_recs:
-                frame_id = f"{s.session_id}_{int(fr.row['frame_global']):07d}_frame"
-                frame_recs = _merge_in_frame(frame_recs, v, cfg)
-                for r in frame_recs:
-                    r.rec["frame_request"] = frame_id if cfg.crop.full_frame else None
-                    _write_crop(out, fr.rgb, r, s, dev, cfg, pool)
-                if cfg.crop.full_frame:
-                    fw, fh = frame_input_size(v.width, v.height)
-                    small = cv2.resize(fr.rgb, (fw, fh), interpolation=cv2.INTER_AREA)
-                    first = frame_recs[0].rec
-                    frame_rec = {"id": frame_id, "kind": "frame", "session_id": s.session_id,
-                                 "frame_global": first["frame_global"], "utc_ms": first["camera"].get("utc_ms"),
-                                 "camera": first["camera"], "anomaly": {}}
-                    pool.submit(out / "frames" / f"{frame_id}.png", small, frame_rec, make=dev.get("manufacturer", ""),
-                                model=dev.get("model", ""), offset_minutes=tz, compress_level=cfg.crop.png_compress_level)
-                recs.extend(frame_recs)
-            frame_order += 1
+            rows = s.frames[s.frames["segment"] == seg]
+            for fr in iter_segment(path, rows, segment=seg, rotate180=rotate180, want=want, allow_extra_rows=True):
+                if fr.rgb is None:
+                    continue
+                selected += 1
+                t_mid, s_anchor = sel_info.pop(fr.index)
+                ana = v.analysis_image(fr.rgb)
+                cands, diag = det.detect(ana, s_anchor, v.gsd_rows_mm)
+                frame_stats.append({"frame_global": int(fr.row["frame_global"]), "s_m": s_anchor, **diag,
+                                    "candidates": len(cands), "band_len": v.band_len})
+                frame_recs = _frame_records(fr, v, cands, t_mid, s_anchor, traj, s, cfg, clock, frame_order)
+                if frame_recs:
+                    frame_id = f"{s.session_id}_{int(fr.row['frame_global']):07d}_frame"
+                    frame_recs = _merge_in_frame(frame_recs, v, cfg)
+                    for r in frame_recs:
+                        r.rec["frame_request"] = frame_id if cfg.crop.full_frame else None
+                        _write_crop(out, fr.rgb, r, s, dev, cfg, pool)
+                    if cfg.crop.full_frame:
+                        fw, fh = frame_input_size(v.width, v.height)
+                        small = cv2.resize(fr.rgb, (fw, fh), interpolation=cv2.INTER_AREA)
+                        first = frame_recs[0].rec
+                        frame_rec = {"id": frame_id, "kind": "frame", "session_id": s.session_id,
+                                     "frame_global": first["frame_global"], "utc_ms": first["camera"].get("utc_ms"),
+                                     "camera": first["camera"], "anomaly": {}}
+                        pool.submit(out / "frames" / f"{frame_id}.png", small, frame_rec, make=dev.get("manufacturer", ""),
+                                    model=dev.get("model", ""), offset_minutes=tz, compress_level=cfg.crop.png_compress_level)
+                    recs.extend(frame_recs)
+                frame_order += 1
     log.info("query: %d frames analysed, %d raw records in %.1f s", selected, len(recs), time.time() - t_query)
 
-    pool.close()  # every crop and frame is on disk (and hashed) before files are moved below
+    # Every crop and frame is on disk (and hashed) before files are moved below.
     # Merge duplicates (strongest evidence kept), then apply the optional budget.
     recs.sort(key=lambda r: (r.frame_order, -r.evidence))
     _dedupe(recs, cfg)
@@ -630,6 +641,16 @@ def _dedupe(recs: list[_Rec], cfg: Config) -> None:
     cell = 2.0  # m; spatial hash for the neighbour search
     kept: dict[tuple[int, int], list[_Rec]] = {}
 
+    def cells(r: _Rec, margin: float = 0.0):
+        x, y = r.enu
+        x0, y0, x1, y1 = x - margin, y - margin, x + margin, y + margin
+        if r.poly is not None:
+            a, b, c, d = r.poly.bounds
+            x0, y0, x1, y1 = min(x0, a), min(y0, b), max(x1, c), max(y1, d)
+        for i in range(math.floor(x0 / cell), math.floor(x1 / cell) + 1):
+            for j in range(math.floor(y0 / cell), math.floor(y1 / cell) + 1):
+                yield i, j
+
     def same(r: _Rec, k: _Rec) -> bool:
         if k.frame_order == r.frame_order:
             return False  # same frame: already merged by crop overlap
@@ -642,20 +663,17 @@ def _dedupe(recs: list[_Rec], cfg: Config) -> None:
         return small > 0 and r.poly.intersection(k.poly).area >= ex.dedupe_overlap * small
 
     for r in sorted((r for r in recs if r.rec["status"] == "candidate"), key=lambda r: -r.evidence):
-        reach = ex.dedupe_dist_m
-        if r.poly is not None:
-            x0, y0, x1, y1 = r.poly.bounds
-            reach = max(reach, x1 - x0, y1 - y0)
-        n = int(math.ceil(reach / cell))
-        ci, cj = int(math.floor(r.enu[0] / cell)), int(math.floor(r.enu[1] / cell))
-        winner = next((k for di in range(-n, n + 1) for dj in range(-n, n + 1)
-                       for k in kept.get((ci + di, cj + dj), ()) if same(r, k)), None)
+        # Index the entire footprint: a small candidate can be inside a large kept crop whose
+        # centroid lies several cells away. A centroid-only hash misses that duplicate.
+        nearby = {id(k): k for key in cells(r, ex.dedupe_dist_m) for k in kept.get(key, ())}
+        winner = next((k for k in sorted(nearby.values(), key=lambda k: -k.evidence) if same(r, k)), None)
         if winner is not None:
             r.rec["status"] = "duplicate"
             r.rec["duplicate_of"] = winner.rec["id"]
             winner.rec.setdefault("duplicates", []).append(r.rec["id"])
         else:
-            kept.setdefault((ci, cj), []).append(r)
+            for key in cells(r):
+                kept.setdefault(key, []).append(r)
 
 
 def _write_crop(out: Path, rgb: np.ndarray, r: _Rec, s: Session, dev: dict, cfg: Config, pool: PngPool) -> None:

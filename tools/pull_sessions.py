@@ -52,11 +52,34 @@ def sha256_file(p: Path) -> str:
 
 
 def verify(d: Path) -> tuple[bool, str, int]:
+    """A malformed/incomplete manifest is a verification failure, never a PC receipt."""
+    try:
+        return _verify(d)
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        return False, f"invalid or unreadable manifest: {e.__class__.__name__}", 0
+
+
+def _verify(d: Path) -> tuple[bool, str, int]:
     m_path = d / "manifest.json"
     m = json.loads(m_path.read_text(encoding="utf-8"))
-    files = m.get("files", [])
+    if not isinstance(m, dict):
+        return False, "manifest must be an object", 0
+    files = m.get("files")
+    if not isinstance(files, list) or not files:
+        return False, "manifest has no files", 0
+    seen = set()
     for f in files:
-        p = d / f["path"]
+        if not isinstance(f, dict):
+            return False, "invalid manifest file entry", 0
+        rel = f["path"]
+        if not isinstance(rel, str) or not rel or "\\" in rel or ":" in rel:
+            return False, "invalid manifest file path", 0
+        p = d / rel
+        if Path(rel).is_absolute() or ".." in Path(rel).parts or not p.resolve().is_relative_to(d.resolve()):
+            return False, f"file path leaves session: {rel}", 0
+        if rel in seen:
+            return False, f"duplicate manifest file: {rel}", 0
+        seen.add(rel)
         if not p.is_file():
             return False, f"missing {f['path']}", 0
         if p.stat().st_size != f["bytes"]:

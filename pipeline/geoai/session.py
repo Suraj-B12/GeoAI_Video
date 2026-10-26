@@ -25,7 +25,9 @@ _INT_NS = {
 
 
 def _read(path: Path, kind: str) -> pd.DataFrame:
-    df = read_csv_safe(path)
+    # A missing value makes CSV inference use float64, irreversibly rounding large clock
+    # integers before the later Int64 conversion. Parse clock columns as strings first.
+    df = read_csv_safe(path, dtype={c: "string" for c in _INT_NS.get(kind, [])})
     for c in _INT_NS.get(kind, []):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")

@@ -1,5 +1,6 @@
 """Folder-batch round trip against a fake classifier server that mimics the VLM team's API."""
 import json
+import importlib.util
 import subprocess
 import sys
 import threading
@@ -14,6 +15,9 @@ from geoai.records import write_png, write_sidecar
 from geoai.vlm import export_batch, import_batch, verify_sums
 
 RUNNER = Path(__file__).resolve().parent.parent / "tools" / "run_vlm_batch.py"
+_spec = importlib.util.spec_from_file_location("run_vlm_batch", RUNNER)
+runner = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(runner)
 
 # Fake answers keyed by the uploaded file name.
 ANSWERS = {
@@ -66,6 +70,7 @@ def server():
     _Handler.calls = []
     yield f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
+    srv.server_close()
 
 
 def _fake_run(root: Path) -> Path:
@@ -133,3 +138,87 @@ def test_runner_refuses_altered_batch(tmp_path, server):
     assert r.returncode == 2 and "SHA256SUMS" in r.stderr
     with pytest.raises(ValueError):
         import_batch(batch, [run], Config())
+
+
+@pytest.mark.parametrize("tail", [b'{"request_id":', b'{"description":"\xe2\x82'])
+def test_resume_repairs_torn_response_without_losing_next_answer(tmp_path, server, tail):
+    run = _fake_run(tmp_path)
+    batch = tmp_path / "batch_torn"
+    export_batch([run], batch, Config())
+    first = _run_runner(batch, server, "--limit", "1")
+    assert first.returncode == 1
+    response_path = batch / "responses.jsonl"
+    good = response_path.read_bytes()
+    response_path.write_bytes(good + tail)
+    resumed = _run_runner(batch, server)
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    rows = [json.loads(line) for line in response_path.read_text().splitlines()]
+    assert len(rows) == 6
+    assert len({r["request_id"] for r in rows}) == 6
+    assert import_batch(batch, [run], Config())["missing"] == 0
+
+
+def test_complete_response_without_newline_is_preserved(tmp_path):
+    path = tmp_path / "responses.jsonl"
+    record = {"request_id": "one", "http_status": 200, "response": {"distress_types": ["Normal"]}}
+    original = json.dumps(record).encode()
+    path.write_bytes(original)
+    runner.repair_response_tail(path)
+    assert path.read_bytes() == original + b"\n"
+    assert runner.answered(path) == {"one"}
+
+
+@pytest.mark.parametrize("status,response", [(429, {"detail": "rate limited"}), (200, None), (200, [])])
+def test_unsuccessful_responses_remain_retryable(tmp_path, monkeypatch, status, response):
+    batch = tmp_path / "batch_retry"
+    batch.mkdir()
+    image = batch / "image.png"
+    image.write_bytes(b"fake image")
+    req = {"request_id": "one", "kind": "crop", "image": image.name, "image_sha256": runner.sha256(image)}
+    (batch / "requests.jsonl").write_text(json.dumps(req) + "\n")
+    (batch / "SHA256SUMS").write_text("")
+    calls = []
+
+    def request(url, *args, **kwargs):
+        if url.endswith("/health"):
+            return 200, {"model": "fake"}
+        calls.append(url)
+        return status, response
+
+    monkeypatch.setattr(runner, "_request", request)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+    monkeypatch.setattr(sys, "argv", ["run_vlm_batch.py", str(batch), "--min-interval", "0"])
+    assert runner.main() == 1
+    assert len(calls) == (6 if status == 429 else 1)
+    saved = json.loads((batch / "responses.jsonl").read_text())
+    assert saved["error"]
+    assert saved["http_status"] == status
+    assert runner.answered(batch / "responses.jsonl") == set()
+
+
+def test_answered_ignores_malformed_records(tmp_path):
+    path = tmp_path / "responses.jsonl"
+    rows = [None, [], {}, {"request_id": "old-bug", "error": None, "http_status": None, "response": None}]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert runner.answered(path) == set()
+
+
+def test_import_reports_malformed_payloads_and_keeps_duplicate_conflicts(tmp_path):
+    run = _fake_run(tmp_path)
+    batch = tmp_path / "batch_malformed"
+    export_batch([run], batch, Config())
+    reqs = [json.loads(line) for line in (batch / "requests.jsonl").read_text().splitlines()]
+    rows = [None, [], {"request_id": []}]
+    for req, payload in zip(reqs[1:], [[], {"distress_types": 7}, {"distress_types": {}},
+                                      {"distress_types": [None]}, {"distress_types": ["Normal"]}]):
+        rows.append({"request_id": req["request_id"], "http_status": 200, "response": payload})
+    # The third response agrees with the second, but does not erase the earlier conflict.
+    for label in ("Potholes", "Normal", "Normal"):
+        rows.append({"request_id": reqs[0]["request_id"], "http_status": 200,
+                     "response": {"distress_types": [label]}})
+    (batch / "responses.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    summary = import_batch(batch, [run], Config())
+    assert summary["answered"] == 6
+    assert summary["valid"] == 1
+    assert summary["problems"] == {"bad_json": 2, "unknown_request": 1, "duplicate_conflict": 1}
+    assert "conflicting duplicate responses" in (run / "vlm_results_batch_malformed.csv").read_text()

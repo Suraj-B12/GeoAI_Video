@@ -46,6 +46,22 @@ def test_chain_of_overlaps_is_not_transitive():
     assert len(kept) == 20  # 40 % < dedupe_overlap 50 %: separate stretches of road
 
 
+def test_small_footprint_inside_large_crop_is_a_duplicate():
+    large = _rec(0, 0, 0, 0, 1, 12, 50)
+    small = _rec(1, 1, 0.1, 0.1, 0.2, 0.2, 10)
+    _dedupe([large, small], Config())
+    assert small.rec["status"] == "duplicate"
+    assert small.rec["duplicate_of"] == large.rec["id"]
+
+
+def test_duplicate_uses_strongest_overlapping_winner():
+    a = _rec(0, 0, 0, 0, 4, 1, 20)
+    b = _rec(1, 0, 2, 0, 4, 1, 30)
+    query = _rec(2, 1, 3, 0.1, 0.2, 0.2, 10)
+    _dedupe([a, b, query], Config())
+    assert query.rec["duplicate_of"] == b.rec["id"]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
 @pytest.mark.parametrize("sigma", [12.0, 24.0, 40.0])
 def test_gpu_blur_matches_opencv(sigma):
@@ -85,6 +101,32 @@ def test_png_pool_writes_the_same_files_as_write_png(tmp_path):
         ref = write_png(tmp_path / "ref" / f"{i}.png", im, r)
         assert shas[i] == ref
         assert hashlib.sha256((tmp_path / "pool" / f"{i}.png").read_bytes()).hexdigest() == ref
+
+
+def test_png_pool_finishes_callbacks_during_long_runs(tmp_path):
+    completed = []
+    pool = PngPool(workers=2, max_pending=3)
+    try:
+        for i in range(40):
+            pool.submit(tmp_path / f"{i}.png", np.zeros((28, 28, 3), np.uint8), None,
+                        on_done=lambda sha, i=i: completed.append(i))
+        # Completed callbacks must not be retained until an entire survey has finished.
+        assert len(completed) >= 37
+    finally:
+        pool.close()
+    assert completed == list(range(40))
+
+
+def test_png_pool_closes_workers_when_processing_fails(tmp_path):
+    completed = []
+    with pytest.raises(ValueError, match="decode failed"):
+        with PngPool(workers=1) as pool:
+            pool.submit(tmp_path / "pending.png", np.zeros((28, 28, 3), np.uint8), None,
+                        on_done=completed.append)
+            raise ValueError("decode failed")
+    assert len(completed) == 1 and (tmp_path / "pending.png").is_file()
+    with pytest.raises(RuntimeError, match="shutdown"):
+        pool.submit(tmp_path / "late.png", np.zeros((28, 28, 3), np.uint8), None)
 
 
 # ---- one crop for distresses close together in a frame ----------------------------------------
