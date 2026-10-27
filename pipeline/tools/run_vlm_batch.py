@@ -8,15 +8,36 @@ Standard library only (Python 3.8+). Usage, from inside the batch folder:
 
 For every image in requests.jsonl it POSTs the file to /classify (multipart field "file") and
 appends one JSON line to responses.jsonl:
-    {"request_id", "kind", "http_status", "seconds", "started_utc", "response": <server JSON>, "error"}
-It verifies SHA256SUMS first, records GET /health in vlm_run.json, respects the server's rate
-limit (10 requests per minute per client), and can be stopped and restarted: images already
-answered without error are skipped. A power cut loses at most the line being written.
+    {"request_id", "kind", "http_status", "seconds", "started_utc", "attempts", "response": <server JSON>, "error"}
+
+- It verifies SHA256SUMS first and stops if any file differs.
+- It records GET /health in vlm_run.json (one entry per run) and warns when /health does not mention
+  the model or prompt version the batch expects.
+- Uploads are streamed from disk. Each image is read once, hashed while it is sent, and never held in
+  memory whole (a full 4K frame is several MB). The hash is checked against requests.jsonl after the
+  upload, so an image that changed on disk is never recorded as answered.
+- It sends one request at a time, starting them at least --min-interval apart (6.5 s keeps within the
+  server's 10 per minute).
+- Retries:
+  - HTTP 429 waits for Retry-After (or backs off);
+  - HTTP 5xx, timeouts and connection errors are retried with exponential backoff (--retries,
+    --retry-wait);
+  - other HTTP errors (e.g. a rejected image) are recorded, and the next image is sent.
+  It stops on 401/403 (wrong API key) and after --max-failures images in a row have failed (server
+  down).
+- It can be stopped and restarted: images already answered without error are skipped. A last line cut
+  off by a power cut is removed before new lines are appended. Ctrl-C stops cleanly after recording
+  what was answered.
+- It prints one progress line per image: its time, the average, and the time left.
+
+Exit codes: 0 every request answered; 1 some still to do (run again); 2 stopped before sending
+(checksums, /health) or on an authentication error; 130 interrupted by Ctrl-C.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -27,143 +48,360 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-RUNNER_VERSION = "1"
+RUNNER_VERSION = "2"
+CHUNK = 1 << 20
+MAX_WAIT_S = 300.0       # longest single backoff or Retry-After wait
+
+
+class Stop(Exception):
+    """A condition under which sending more images is pointless (wrong API key, server down)."""
+
+    def __init__(self, message: str, exit_code: int):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def sha256(p: Path) -> str:
     h = hashlib.sha256()
     with open(p, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
+        for chunk in iter(lambda: f.read(CHUNK), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
 def check_sums(d: Path) -> list:
-    bad = []
-    for line in (d / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        digest, rel = line.split("  ", 1)
-        p = d / rel
-        if not p.exists() or sha256(p) != digest:
-            bad.append(rel)
-    return bad
+    """Files whose SHA-256 differs from SHA256SUMS, or that are missing (empty list = intact)."""
+    entries = [line.split("  ", 1) for line in (d / "SHA256SUMS").read_text(encoding="utf-8").splitlines() if line.strip()]
+    total = sum((d / rel).stat().st_size for _, rel in entries if (d / rel).exists())
+    print(f"checking {len(entries)} files ({total / 1e9:.2f} GB) against SHA256SUMS ...", flush=True)
+    return [rel for digest, rel in entries if not (d / rel).exists() or sha256(d / rel) != digest]
 
 
-def _request(url, data=None, headers=None, timeout=300.0):
-    req = urllib.request.Request(url, data=data, headers=headers or {}, method="POST" if data is not None else "GET")
+def get_json(url: str, headers: dict, timeout: float):
+    """(status, parsed JSON or None) of a GET."""
+    req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            body = r.read()
-            return r.status, json.loads(body.decode("utf-8")) if body else None
+            return r.status, _parse_json(r.read())
     except urllib.error.HTTPError as e:
-        body = e.read()
+        return e.code, _parse_json(e.read())
+
+
+def _parse_json(raw: bytes):
+    try:
+        return json.loads(raw.decode("utf-8")) if raw else None
+    except ValueError:
+        return None
+
+
+class MultipartFile:
+    """A multipart/form-data body with one file field, produced in chunks.
+
+    http.client sends any body that has read() block by block, so the image is streamed from disk
+    instead of being joined into one bytes object (the old runner held each image twice in memory).
+    The file's bytes are hashed as they go out; `complete` and `hexdigest()` tell afterwards whether
+    exactly the expected file was sent.
+    """
+
+    def __init__(self, path: Path, field: str = "file", content_type: str = "image/png"):
+        boundary = "geoai" + uuid.uuid4().hex
+        self.content_type = "multipart/form-data; boundary=" + boundary
+        self._head = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; "
+                      f"filename=\"{path.name}\"\r\nContent-Type: {content_type}\r\n\r\n").encode("utf-8")
+        self._tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        self._size = path.stat().st_size
+        self.length = len(self._head) + self._size + len(self._tail)
+        self._f = open(path, "rb")
+        self._hash = hashlib.sha256()
+        self._sent_file = 0
+        self._pos = 0  # position in head + file + tail
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            n = self.length
+        out = bytearray()
+        head, size = len(self._head), self._size
+        while len(out) < n and self._pos < self.length:
+            want = n - len(out)
+            if self._pos < head:
+                part = self._head[self._pos:self._pos + want]
+            elif self._pos < head + size:
+                part = self._f.read(min(want, CHUNK, head + size - self._pos))
+                if not part:
+                    raise OSError("image became shorter during upload")
+                self._hash.update(part)
+                self._sent_file += len(part)
+            else:
+                start = self._pos - head - size
+                part = self._tail[start:start + want]
+            out += part
+            self._pos += len(part)
+        return bytes(out)
+
+    @property
+    def complete(self) -> bool:
+        return self._sent_file == self._size
+
+    def hexdigest(self) -> str:
+        return self._hash.hexdigest()
+
+    def close(self) -> None:
+        self._f.close()
+
+
+def post_file(url: str, path: Path, headers: dict, timeout: float):
+    """POST one image; returns (status, parsed JSON or None, raw text excerpt, response headers, body).
+
+    Connection errors and timeouts are raised (OSError, http.client.HTTPException) for the caller to retry.
+    """
+    body = MultipartFile(path)
+    try:
+        req = urllib.request.Request(url, data=body, method="POST", headers={
+            **headers, "Content-Type": body.content_type, "Content-Length": str(body.length)})
         try:
-            return e.code, json.loads(body.decode("utf-8"))
-        except ValueError:
-            return e.code, {"text": body.decode("utf-8", "replace")[:2000]}
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                status, raw, resp_headers = r.status, r.read(), r.headers
+        except urllib.error.HTTPError as e:
+            status, raw, resp_headers = e.code, e.read(), e.headers
+        return status, _parse_json(raw), raw[:2000].decode("utf-8", "replace"), resp_headers, body
+    finally:
+        body.close()
 
 
-def multipart(path: Path):
-    boundary = "geoai" + uuid.uuid4().hex
-    head = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{path.name}\"\r\n"
-            f"Content-Type: image/png\r\n\r\n").encode("utf-8")
-    body = head + path.read_bytes() + f"\r\n--{boundary}--\r\n".encode("utf-8")
-    return body, f"multipart/form-data; boundary={boundary}"
+class Pacer:
+    """Keeps request starts at least `interval` seconds apart (the server's rate limit)."""
+
+    def __init__(self, interval: float):
+        self.interval = interval
+        self._last = None
+
+    def wait(self) -> None:
+        if self._last is not None:
+            delay = self.interval - (time.monotonic() - self._last)
+            if delay > 0:
+                time.sleep(delay)
+        self._last = time.monotonic()
+
+
+def backoff(attempt: int, base: float) -> float:
+    return min(MAX_WAIT_S, base * 2 ** (attempt - 1))
+
+
+def retry_after(resp_headers, default: float) -> float:
+    try:
+        return min(MAX_WAIT_S, max(0.0, float(resp_headers.get("Retry-After"))))
+    except (TypeError, ValueError, AttributeError):
+        return default
+
+
+def send_one(d: Path, req: dict, url: str, headers: dict, a, pacer: Pacer) -> dict:
+    """Classify one image, with retries; returns its responses.jsonl line."""
+    line = {"request_id": req["request_id"], "kind": req.get("kind"), "http_status": None, "seconds": None,
+            "started_utc": None, "attempts": 0, "response": None, "error": None}
+    img = d / req["image"]
+    if not img.exists():
+        line["error"] = "image missing"
+        return line
+    size = img.stat().st_size
+    if size > a.max_upload_mb * 1e6:
+        line["error"] = f"image is {size} bytes, over the server's upload limit ({a.max_upload_mb} MB)"
+        return line
+    for attempt in range(1, a.retries + 2):
+        pacer.wait()
+        line["attempts"] = attempt
+        line["started_utc"] = utc_now()
+        t0 = time.monotonic()
+        try:
+            status, resp, text, resp_headers, body = post_file(url, img, headers, a.timeout)
+        except (OSError, http.client.HTTPException) as e:  # URLError, timeouts, resets are all OSError
+            line.update(seconds=round(time.monotonic() - t0, 3), http_status=None, response=None,
+                        error=f"{type(e).__name__}: {e}")
+            if attempt <= a.retries:
+                wait = backoff(attempt, a.retry_wait)
+                print(f"    {req['request_id']}: {line['error']}; retry in {wait:.0f} s", flush=True)
+                time.sleep(wait)
+                continue
+            return line
+        line["seconds"] = round(time.monotonic() - t0, 3)
+        line["http_status"] = status
+        if not body.complete or body.hexdigest() != req["image_sha256"]:
+            line.update(response=None, error="image checksum differs from requests.jsonl (file changed on disk)")
+            return line
+        line["response"] = resp if resp is not None else {"text": text}
+        if status == 200 and isinstance(resp, dict):
+            line["error"] = None
+            return line
+        line["error"] = f"HTTP {status}" if status != 200 else "HTTP 200 without a JSON object"
+        if status in (401, 403):
+            raise Stop(f"the server refused the request (HTTP {status}): check --api-key", 2)
+        if (status == 429 or status >= 500) and attempt <= a.retries:
+            wait = backoff(attempt, a.retry_wait)
+            if status == 429:
+                wait = retry_after(resp_headers, wait)
+            print(f"    {req['request_id']}: HTTP {status}; retry in {wait:.0f} s", flush=True)
+            time.sleep(wait)
+            continue
+        return line
+    return line
 
 
 def answered(resp_path: Path) -> set:
+    """Request ids with a response line without an error (unreadable lines are ignored)."""
     done = set()
     if not resp_path.exists():
         return done
-    lines = resp_path.read_text(encoding="utf-8").splitlines()
-    for i, line in enumerate(lines):
+    for line in resp_path.read_text(encoding="utf-8").splitlines():
         try:
             r = json.loads(line)
         except ValueError:
-            continue  # a half-written last line after an interruption
-        if not r.get("error"):
+            continue
+        if isinstance(r, dict) and r.get("request_id") and not r.get("error"):
             done.add(r["request_id"])
     return done
 
 
-def main() -> int:
+def repair_tail(resp_path: Path) -> str | None:
+    """Make responses.jsonl end with a newline before appending; returns what was done, or None.
+
+    Lines are written whole and then synced, so a missing final newline means the write was cut off.
+    A cut-off fragment is removed (its image is sent again). A complete JSON line that lost only its
+    newline keeps its answer: the newline is added.
+    """
+    if not resp_path.exists():
+        return None
+    data = resp_path.read_bytes()
+    if not data or data.endswith(b"\n"):
+        return None
+    cut = data.rfind(b"\n") + 1
+    try:
+        json.loads(data[cut:].decode("utf-8"))
+    except ValueError:
+        with open(resp_path, "r+b") as f:
+            f.truncate(cut)
+        return f"removed a cut-off last line ({len(data) - cut} bytes)"
+    with open(resp_path, "ab") as f:
+        f.write(b"\n")
+    return "added the missing newline after the last line"
+
+
+def write_json(path: Path, obj) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def fmt_h(seconds: float) -> str:
+    m = int(round(seconds / 60))
+    return f"{m // 60} h {m % 60:02d} min" if m >= 60 else f"{m} min"
+
+
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("batch_dir", type=Path)
     ap.add_argument("--url", default="http://127.0.0.1:8000")
     ap.add_argument("--api-key", default=None)
-    ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument("--timeout", type=float, default=300.0, help="seconds to wait on the server per request")
     ap.add_argument("--min-interval", type=float, default=6.5, help="seconds between request starts (10/min limit)")
     ap.add_argument("--limit", type=int, default=0, help="stop after this many new requests (0 = all)")
-    a = ap.parse_args()
+    ap.add_argument("--only-kind", choices=("segment", "crop", "frame"), default=None,
+                    help="send only requests of this kind")
+    ap.add_argument("--retries", type=int, default=4, help="retries per image after timeouts, 429 and 5xx")
+    ap.add_argument("--retry-wait", type=float, default=5.0, help="first backoff in seconds (doubles per retry)")
+    ap.add_argument("--max-failures", type=int, default=5, help="stop after this many failed images in a row")
+    ap.add_argument("--max-upload-mb", type=float, default=10.0, help="the server's upload limit (MB)")
+    a = ap.parse_args(argv)
     d = a.batch_dir.resolve()
+    try:
+        return run(d, a)
+    except KeyboardInterrupt:
+        print("\ninterrupted before any image was sent", file=sys.stderr)
+        return 130
+
+
+def run(d: Path, a) -> int:
     bad = check_sums(d)
     if bad:
         print(f"STOP: {len(bad)} files differ from SHA256SUMS (copy the batch again): {bad[:5]}", file=sys.stderr)
         return 2
+    batch = json.loads((d / "batch.json").read_text(encoding="utf-8")) if (d / "batch.json").exists() else {}
     headers = {"X-API-Key": a.api_key} if a.api_key else {}
-    status, health = _request(a.url.rstrip("/") + "/health", headers=headers, timeout=30)
+    base = a.url.rstrip("/")
+    try:
+        status, health = get_json(base + "/health", headers, 30.0)
+    except (OSError, http.client.HTTPException) as e:
+        print(f"STOP: cannot reach {base}/health ({e}). Is the classifier server running?", file=sys.stderr)
+        return 2
     if status != 200:
         print(f"STOP: GET /health returned {status}: {health}", file=sys.stderr)
         return 2
-    run_path = d / "vlm_run.json"
-    run = json.loads(run_path.read_text(encoding="utf-8")) if run_path.exists() else {"runs": []}
-    this = {"started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "url": a.url, "health": health,
-            "runner_version": RUNNER_VERSION, "host": platform.node(), "python": platform.python_version()}
-    run["runs"].append(this)
-    run["health"] = health
-    run_path.write_text(json.dumps(run, indent=2), encoding="utf-8")
+    said = json.dumps(health)
+    for key, what in (("expected_prompt_version", "prompt version"), ("expected_model_id", "model")):
+        want = str(batch.get(key) or "")
+        if want and want.split("@")[0] not in said:
+            print(f"WARNING: /health does not mention the expected {what} {want!r}: {said[:300]}", file=sys.stderr)
 
-    reqs = [json.loads(l) for l in (d / "requests.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    run_path = d / "vlm_run.json"
+    log = json.loads(run_path.read_text(encoding="utf-8")) if run_path.exists() else {"runs": []}
+    this = {"started_utc": utc_now(), "url": a.url, "health": health, "runner_version": RUNNER_VERSION,
+            "host": platform.node(), "python": platform.python_version()}
     resp_path = d / "responses.jsonl"
+    fixed = repair_tail(resp_path)
+    if fixed:
+        print(f"responses.jsonl: {fixed}")
+        this["repaired"] = fixed
+    log["runs"].append(this)
+    log["health"] = health
+    write_json(run_path, log)
+
+    reqs = [json.loads(x) for x in (d / "requests.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]
+    if a.only_kind:
+        reqs = [r for r in reqs if r.get("kind") == a.only_kind]
     done = answered(resp_path)
     todo = [r for r in reqs if r["request_id"] not in done]
-    print(f"{len(reqs)} requests, {len(done)} already answered, {len(todo)} to send")
-    sent = ok = 0
-    last_start = 0.0
-    with open(resp_path, "a", encoding="utf-8", newline="\n") as out:
-        for req in todo:
-            if a.limit and sent >= a.limit:
-                break
-            img = d / req["image"]
-            rec = {"request_id": req["request_id"], "kind": req.get("kind"), "http_status": None, "seconds": None,
-                   "started_utc": None, "response": None, "error": None}
-            if sha256(img) != req["image_sha256"]:
-                rec["error"] = "image checksum mismatch"
-            else:
-                body, ctype = multipart(img)
-                for attempt in range(6):
-                    wait = a.min_interval - (time.time() - last_start)
-                    if wait > 0:
-                        time.sleep(wait)
-                    last_start = time.time()
-                    rec["started_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                    try:
-                        status, resp = _request(a.url.rstrip("/") + "/classify", body,
-                                                {**headers, "Content-Type": ctype}, a.timeout)
-                    except Exception as e:  # noqa: BLE001 - recorded, retried next run
-                        status, resp = None, None
-                        rec["error"] = repr(e)
-                        break
-                    if status == 429:  # rate limited: back off and retry
-                        time.sleep(10 * (attempt + 1))
-                        continue
-                    rec["http_status"] = status
-                    rec["response"] = resp
-                    rec["error"] = None if status == 200 else f"HTTP {status}"
-                    break
-                rec["seconds"] = round(time.time() - last_start, 3)
-            out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            out.flush()
-            os.fsync(out.fileno())
-            sent += 1
-            ok += rec["error"] is None
-            print(f"[{sent}/{len(todo)}] {req['request_id']} {'ok' if rec['error'] is None else rec['error']}", flush=True)
-    this["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if a.limit:
+        todo = todo[:a.limit]
+    print(f"{len(reqs)} requests, {len(done & {r['request_id'] for r in reqs})} already answered, "
+          f"{len(todo)} to send now (about {fmt_h(len(todo) * 14)} at ~14 s each)", flush=True)
+    sent = ok = failed_in_row = 0
+    pacer = Pacer(a.min_interval)
+    t_start = time.monotonic()
+    code = None
+    try:
+        with open(resp_path, "a", encoding="utf-8", newline="\n") as out:
+            for req in todo:
+                line = send_one(d, req, base + "/classify", headers, a, pacer)
+                out.write(json.dumps(line, ensure_ascii=False) + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+                sent += 1
+                ok += line["error"] is None
+                failed_in_row = 0 if line["error"] is None else failed_in_row + 1
+                per = (time.monotonic() - t_start) / sent
+                state = "ok" if line["error"] is None else line["error"]
+                print(f"[{sent}/{len(todo)}] {req['request_id']} {state} {line['seconds'] or 0:.1f} s | "
+                      f"{per:.1f} s/image | left ~{fmt_h(per * (len(todo) - sent))}", flush=True)
+                if failed_in_row >= a.max_failures:
+                    raise Stop(f"{failed_in_row} images in a row failed (last: {line['error']}); is the server up?", 1)
+    except Stop as e:
+        print(f"STOP: {e}", file=sys.stderr)
+        this["stopped"] = str(e)
+        code = e.exit_code
+    except KeyboardInterrupt:
+        print("\ninterrupted (Ctrl-C): every answer so far is saved; run the same command again to continue",
+              file=sys.stderr)
+        this["interrupted"] = True
+        code = 130
+    this["finished_utc"] = utc_now()
     this["sent"], this["ok"] = sent, ok
-    run_path.write_text(json.dumps(run, indent=2), encoding="utf-8")
-    remaining = len(todo) - ok
-    print(f"done: {ok} answered, {remaining} still to do" + (" (run again to retry)" if remaining else ""))
+    write_json(run_path, log)
+    remaining = len([r for r in reqs if r["request_id"] not in answered(resp_path)])
+    print(f"done: {ok} answered in this run, {remaining} still to do" + (" (run again to retry)" if remaining else ""))
+    if code is not None:
+        return code
     return 0 if remaining == 0 else 1
 
 

@@ -461,7 +461,7 @@ class CameraRecorder(
         .put("predicted_edge_blur_px", p.edgeBlurPx)
         .put("road_rows_active_array", JSONArray().put(p.roiTop).put(p.roiBottom))
         .put("road_rows_frac", JSONArray().put(p.roiTopFrac).put(p.roiBottomFrac))
-        .put("far_road_limit_m", p.nearRoadM + FocusPlanner.SEGMENT_REACH_M)
+        .put("segment_reach_m", FocusPlanner.SEGMENT_REACH_M)
         .put("segment_length_m", FocusPlanner.SEGMENT_LENGTH_M)
         .put("segment_window_m", FocusPlanner.SEGMENT_WINDOW_M)
         .put("view_far_m", p.view.farM ?: JSONObject.NULL)

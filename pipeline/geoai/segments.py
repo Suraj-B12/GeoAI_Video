@@ -18,8 +18,8 @@ with the square of the distance ahead, so these are the frames that resolve the 
 Which of them is best (§3). Every candidate is scored by the normalised Tenengrad of the segment's
 rows (lane columns only). Defocus, vibration and compression differ from frame to frame, and the
 sharpest frame is the one with the least of them. Motion smear cannot be chosen away (speed and
-shutter are the same in neighbouring frames): it is predicted from speed, exposure and the gyro and
-used as a filter, and it is recorded.
+shutter are the same in neighbouring frames): it is predicted from speed, exposure and the gyro,
+used as a filter, and recorded.
 
 Streaming (one decode pass). Frames are offered in time order, so c never decreases; a segment is
 final once c has passed its window. Only the best RGB of each open segment is kept: with the default
@@ -30,7 +30,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 import cv2
 import numpy as np
@@ -42,11 +42,12 @@ from .config import Config, SegmentConfig
 from .geometry import CameraModel
 from .trajectory import Trajectory
 
-# Farthest road counted as "visible". Beyond it a pixel row spans more than about 0.9 m of road
-# (S21, 1.35 m height), so a farther "far edge" would add nothing a classifier could use.
+# Farthest road counted as "visible". At 60 m one pixel row spans about 0.8 m of road (S21, 23 deg,
+# 1.35 m height), so a farther "far edge" would add nothing a classifier could use.
 FAR_CAP_M = 60.0
-# Gyro samples further apart than this are a gap (the stream is 200 Hz): no rate is interpolated
-# across it, so a dropout never reads as a calm camera.
+# Gyro samples further apart than this are a gap (the stream is 200 Hz, 5 ms; the S21 sessions of
+# 26 Oct never exceeded 7.6 ms): no rate is interpolated across it, so a dropout never reads as a
+# calm camera.
 GYRO_MAX_GAP_S = 0.05
 # Camera positions come from np.interp on the 100 Hz trajectory grid; rounding at grid boundaries can
 # make consecutive positions decrease by ~1e-15 m. Anything larger is an ordering error.
@@ -54,12 +55,15 @@ _C_TOL_M = 1e-6
 # Footprint polygons are simplified to this tolerance (m); image edges are straight lines on the
 # ground for a pinhole camera, so this only removes collinear boundary samples.
 _FOOTPRINT_SIMPLIFY_M = 0.002
+# Image-edge sampling step (px) for the footprint; fine enough to follow lens distortion.
+_FOOTPRINT_STEP_PX = 8
 
 # Reason codes. A chosen frame's reason is indexed by its tier (2 x low_light + over_blur_limit).
 CHOSEN_REASONS = ("sharpest", "sharpest_over_blur_limit", "only_low_light", "only_low_light_over_blur_limit")
 # Why a frame inside a window is not a candidate, in priority order (one reason per frame).
 EXCLUSION_REASONS = ("gnss_gap", "black", "reversing", "standing", "low_light")
-# Why a window saw no frame at all.
+# Why a window saw no frame at all. no_frame_in_window: consecutive frames straddled the window
+# (speed x frame period > window_m, about 108 km/h at 30 fps with the 1 m default).
 EMPTY_REASONS = ("no_frames", "before_recording", "after_recording", "no_frame_in_window")
 
 
@@ -77,7 +81,7 @@ def _finite(x) -> float:
     return v if math.isfinite(v) else math.nan
 
 
-def _json_num(x: float) -> float | None:
+def _json_num(x: float | None) -> float | None:
     """A float for a JSON record: None where the value is unknown (NaN)."""
     return None if x is None or not math.isfinite(x) else float(x)
 
@@ -98,41 +102,62 @@ class Segment:
 
 
 def plan_segments(traj: Trajectory, cfg: Config | SegmentConfig, *, t_span: tuple[float, float] | None = None,
-                  near_m: float = 0.0) -> list[Segment]:
+                  offset_m: float = 0.0) -> list[Segment]:
     """Consecutive segments of `length_m` from the first valid trajectory position to the last.
 
     A final remainder is kept as a `partial` segment when it is at least half a segment long;
     shorter remainders are dropped (a classification of under half a segment would be weighted like
     a whole one in "% of length" statistics). Segments are not split at GNSS gaps: a segment inside a
-    gap simply gets no candidate frame and is reported as not covered.
+    gap simply gets no candidate frame and is reported as not covered. Positions are
+    s0 = start + k x length_m (no accumulated rounding); the partial segment ends at the last position.
 
-    t_span: optional (first, last) frame time in trajectory seconds. GNSS usually starts before the
-        recording and stops after it; with t_span the plan covers only positions the camera held
-        while recording (the spec's "first valid position" within the recording).
-    near_m: optional offset of the whole plan (SegmentGeometry.near_m). The camera at c sees road from
-        c + near_m on, so the road the recording covers is [c_first + near_m, c_last + near_m];
-        without the offset the first segment's near edge was never in view and it is not covered.
-    Positions s0, s1 = start + k x length (no accumulated rounding).
+    With the defaults this is the spec's plan (§3). Two optional arguments make it the plan of the
+    road the RECORDING can cover; the orchestrator should pass both:
+    t_span: (first, last) frame time in trajectory seconds (extract._RowClock of the first and last
+        frame's centre row). GNSS usually starts before the recording and stops after it; without
+        t_span the segments of those stretches are planned and reported as not covered.
+    offset_m: shift of the whole plan along s; use `plan_offset_m(geoms, cfg)` = near_m + window_m.
+        The camera at c sees road from c + near_m on, so segment k's candidate window is
+        [s0 - near_m - window_m, s0 - near_m]. Unshifted, the first segment's window lies before the
+        first frame and it can never be covered; shifted by near_m + window_m, the first window starts
+        at the first recorded position and every window of the plan lies inside the recording.
     """
     L = float(_seg_cfg(cfg).length_m)
     if not L > 0:
         raise ValueError(f"segment length must be positive, got {L}")
+    if not math.isfinite(offset_m):
+        raise ValueError(f"offset_m must be finite, got {offset_m}")
     t_lo, t_hi = (float(traj.t[0]), float(traj.t[-1])) if t_span is None else (float(t_span[0]), float(t_span[1]))
+    if not t_lo <= t_hi:
+        raise ValueError(f"t_span must be (first, last) with first <= last, got {t_span}")
     ok = traj.valid & (traj.t >= t_lo) & (traj.t <= t_hi)
     if not ok.any():
         return []
-    # Exact positions at the span ends when they are valid (the trajectory grid is 10 ms).
+    # Exact positions at the span ends when they are valid (the trajectory grid is 10 ms apart).
     p = traj.sample(np.array([t_lo, t_hi]))
     s_first = float(p["s"][0]) if p["valid"][0] else float(traj.s[ok][0])
     s_last = float(p["s"][1]) if p["valid"][1] else float(traj.s[ok][-1])
-    start = s_first + near_m
+    start = s_first + float(offset_m)
     total = s_last - s_first
     n_full = int(math.floor(total / L + 1e-9))
     segs = [Segment(k, start + k * L, start + (k + 1) * L, False) for k in range(n_full)]
-    rest = total - n_full * L
-    if rest >= 0.5 * L - 1e-9:
+    if total - n_full * L >= 0.5 * L - 1e-9:
         segs.append(Segment(n_full, start + n_full * L, start + total, True))
     return segs
+
+
+def _view_range(geoms: Sequence["SegmentGeometry"]) -> tuple[float, float]:
+    """(near_m, far_m) valid for every recording size: the largest near and the smallest far."""
+    if not geoms:
+        raise ValueError("at least one SegmentGeometry is needed")
+    return max(g.near_m for g in geoms), min(g.far_m for g in geoms)
+
+
+def plan_offset_m(geoms: "SegmentGeometry | Sequence[SegmentGeometry]", cfg: Config | SegmentConfig) -> float:
+    """near_m + window_m: the `offset_m` that gives every planned segment a whole candidate window
+    inside the recording (see plan_segments). With several recording sizes, the largest near_m."""
+    g = [geoms] if isinstance(geoms, SegmentGeometry) else list(geoms)
+    return _view_range(g)[0] + float(_seg_cfg(cfg).window_m)
 
 
 # ---- geometry --------------------------------------------------------------------------------
@@ -150,6 +175,7 @@ class SegmentGeometry:
     def build(cls, model: CameraModel, cfg: Config) -> "SegmentGeometry":
         """Geometry of `model` (full resolution, display orientation, e.g. extract.nominal_model).
 
+        The lowest usable row is the one plan_view uses: v <= H x (1 - bottom_exclude_frac) - 1.
         Raises ValueError when segment mode cannot work with this view: no road at the bottom row,
         a rearward camera (segments are defined ahead of the camera), or a view too short to hold a
         whole segment (`length_m` > far_m - near_m).
@@ -165,7 +191,7 @@ class SegmentGeometry:
         if y[0] <= 0:
             raise ValueError("segment mode needs a forward-looking camera (the bottom row sees road behind it)")
         near = float(y[0])
-        far_top = float(y[1]) if ok[1] else math.inf  # top row above the horizon: road to infinity in view
+        far_top = float(y[1]) if ok[1] else math.inf  # top row above the horizon: road to the horizon in view
         far = min(far_top, FAR_CAP_M)
         L = float(cfg.segments.length_m)
         if far - near < L:
@@ -224,7 +250,8 @@ class SegmentGeometry:
         """Ground polygon of the usable image (outermost pixel centres), cut where rows reach 2 x FAR_CAP_M.
 
         Image rows map to straight ground lines, and along a row the distance ahead is monotonic, so
-        a row whose two end pixels see the ground within the bound lies wholly within it.
+        a row whose two end pixels see the ground within the bound lies wholly within it. Rows are
+        good from the first such row down to the bottom (the camera looks down at the road).
         """
         m = self.model
         W = m.width
@@ -232,10 +259,12 @@ class SegmentGeometry:
         _, yl, okl = m.pixel_to_ground(np.zeros_like(rows), rows)
         _, yr, okr = m.pixel_to_ground(np.full_like(rows, W - 1.0), rows)
         good = okl & okr & (yl <= 2 * FAR_CAP_M) & (yr <= 2 * FAR_CAP_M)
+        if not good[-1]:
+            raise ValueError("the bottom usable row does not see the road across the whole width")
         v_a = float(rows[int(np.argmax(good))])
-        step = 8
-        us = np.unique(np.r_[np.arange(0, W - 1, step), W - 1]).astype(np.float64)
-        vs = np.unique(np.r_[np.arange(v_a, self.v_usable, step), self.v_usable]).astype(np.float64)
+        st = _FOOTPRINT_STEP_PX
+        us = np.unique(np.r_[np.arange(0, W - 1, st), W - 1]).astype(np.float64)
+        vs = np.unique(np.r_[np.arange(v_a, self.v_usable, st), self.v_usable]).astype(np.float64)
         u = np.concatenate([us, np.full(len(vs), W - 1.0), us[::-1], np.zeros(len(vs))])
         v = np.concatenate([np.full(len(us), v_a), vs, np.full(len(us), float(self.v_usable)), vs[::-1]])
         x, y, ok = m.pixel_to_ground(u, v)
@@ -246,9 +275,12 @@ class SegmentGeometry:
         """Ground polygon of the segment as seen: the strip d0 <= y <= d1 inside the usable image.
 
         Returns the closed ring (first vertex repeated last) of (x, y) ground points, metres from the
-        camera nadir, counter-clockwise (x right, y ahead), as RFC 7946 wants for exterior rings once
-        rotated into east/north by the camera heading. The width is what the frame shows at each
-        distance; near the bottom row a rolled camera cuts one corner, which the polygon follows.
+        camera nadir, counter-clockwise (x right, y ahead). Rotating into (east, north) by the camera
+        heading is a proper rotation, so the ring stays counter-clockwise as RFC 7946 wants for an
+        exterior ring. The width is what the frame shows at each distance; parts of the strip below
+        the bottom row (d0 < near_m) are not in the frame and not in the polygon, and near the bottom
+        row a rolled camera cuts one corner, which the polygon follows. For the record pass the chosen
+        frame's (near_edge_ahead_m, far_edge_ahead_m).
         """
         if not d1 > d0:
             raise ValueError("footprint needs d0 < d1")
@@ -299,37 +331,39 @@ def sharpness(rgb: np.ndarray, rows: tuple[int, int], *, cols: tuple[float, floa
     """Normalised Tenengrad of rows [r0, r1) and the column band `cols` (fractions of the width).
 
     mean(Gx² + Gy²) / mean(I)², with 3x3 Sobel gradients of the grey image (BT.601 weights, float, so
-    no rounding before the gradients), after INTER_AREA downscaling by `downscale` (<= 1). Only
-    pixels whose 3x3 neighbourhood lies inside the region count, so the region's borders add nothing.
-    Dividing by the squared mean makes it independent of exposure and gain: I -> kI scales both by
-    k². The column band keeps the lane and leaves out the roadside (vegetation, parked vehicles),
-    whose texture would otherwise dominate. 0 for a black region.
+    no rounding before the gradients), after INTER_AREA downscaling by `downscale` (<= 1). Grey
+    conversion and area averaging are both linear, so cutting the region first gives the same image
+    as cutting it from a downscaled whole frame (up to the region's border pixels) at a fraction of
+    the cost. Only pixels whose 3x3 neighbourhood lies inside the region count, so the region's
+    borders add nothing. Dividing by the squared mean makes it independent of exposure and gain:
+    I -> kI scales both by k². The column band keeps the lane and leaves out the roadside
+    (vegetation, parked vehicles), whose texture would otherwise dominate. 0 for a black region.
     """
     c_lo, c_hi = cols
     if not 0.0 <= c_lo < c_hi <= 1.0:
         raise ValueError(f"sharpness columns must satisfy 0 <= lo < hi <= 1, got {cols}")
     if not 0.0 < downscale <= 1.0:
         raise ValueError(f"sharpness downscale must be in (0, 1], got {downscale}")
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError(f"sharpness needs an H x W x 3 RGB image, got {rgb.shape}")
     H, W = rgb.shape[:2]
     r0, r1 = max(0, int(rows[0])), min(H, int(rows[1]))
     c0, c1 = int(round(c_lo * W)), int(round(c_hi * W))
-    region = rgb[r0:r1, c0:c1]
-    if region.ndim != 3 or region.shape[2] != 3:
-        raise ValueError(f"sharpness needs an H x W x 3 RGB image, got {rgb.shape}")
-    grey = cv2.cvtColor(region.astype(np.float32), cv2.COLOR_RGB2GRAY)
+    if r1 - r0 < 3 or c1 - c0 < 3:
+        raise ValueError(f"sharpness region too small: rows {r0}..{r1}, columns {c0}..{c1}")
+    grey = cv2.cvtColor(rgb[r0:r1, c0:c1].astype(np.float32), cv2.COLOR_RGB2GRAY)
     if downscale < 1.0:
         h, w = grey.shape
         size = (max(1, int(round(w * downscale))), max(1, int(round(h * downscale))))
         grey = cv2.resize(grey, size, interpolation=cv2.INTER_AREA)
     if grey.shape[0] < 3 or grey.shape[1] < 3:
         raise ValueError(f"sharpness region too small ({grey.shape[1]} x {grey.shape[0]} px after downscaling)")
-    gx = cv2.Sobel(grey, cv2.CV_32F, 1, 0, ksize=3)[1:-1, 1:-1]
-    gy = cv2.Sobel(grey, cv2.CV_32F, 0, 1, ksize=3)[1:-1, 1:-1]
+    gx = cv2.Sobel(grey, cv2.CV_32F, 1, 0, ksize=3)[1:-1, 1:-1].astype(np.float64)
+    gy = cv2.Sobel(grey, cv2.CV_32F, 0, 1, ksize=3)[1:-1, 1:-1].astype(np.float64)
     mean_i = float(grey[1:-1, 1:-1].mean(dtype=np.float64))
     if mean_i <= 0.0:
         return 0.0
-    g2 = float(np.mean(gx.astype(np.float64) ** 2 + gy.astype(np.float64) ** 2))
-    return g2 / (mean_i * mean_i)
+    return float(np.mean(gx * gx + gy * gy)) / (mean_i * mean_i)
 
 
 def predicted_blur(speed_mps: float, exposure_ns, gsd_along_mm: float, omega_perp_rad_s: float,
@@ -353,21 +387,25 @@ def predicted_blur(speed_mps: float, exposure_ns, gsd_along_mm: float, omega_per
 class GyroImageRates:
     """|ω⊥|: the camera's angular rate about its two image axes (rad/s), from imu.csv gyro samples.
 
-    Axes. imu.csv `gyro` is rad/s about the DEVICE axes (x right, y up, z out of the screen, phone in
-    its natural orientation), counter-clockwise positive, i.e. right-handed. `cam_from_device`
-    (geometry.cam_from_device(sensor_orientation)) has the camera axes as rows: x = image right,
-    y = image down, z = optical axis (device -z for the back camera). Angular velocity is an axial
-    vector, and a proper rotation transforms it like any vector: ω_cam = R ω_dev. A rotation about
-    camera x moves the image vertically (pitch), about camera y horizontally (pan); a rotation about
-    z turns the image around the principal point and is not part of ω⊥ (spec §3). The 180° display
-    rotation of an UPSIDE_DOWN mount negates both image axes, so |ω⊥| does not depend on it.
+    Axes. imu.csv `gyro` is rad/s about the DEVICE axes (Android sensor frame: x right, y up, z out of
+    the screen, phone in its natural orientation), counter-clockwise positive, i.e. right-handed.
+    `cam_from_device` (geometry.cam_from_device(sensor_orientation)) has the camera axes as rows, in
+    device coordinates: x = image right, y = image down, z = optical axis (device -z for the back
+    camera); it is a proper rotation (det +1). Angular velocity is an axial vector, and a proper
+    rotation transforms it like any vector: ω_cam = R ω_dev. A rotation about camera x moves the
+    image vertically (pitch), about camera y horizontally (pan); a rotation about z turns the image
+    around the principal point and is not part of ω⊥ (spec §3). Because the optical axis is device
+    ±z for every sensor orientation, |ω⊥| = hypot(ω_dev_x, ω_dev_y); the rotation is applied anyway so
+    the per-axis rates (wx = pitch, wy = pan) are right too. The 180° display rotation of an
+    UPSIDE_DOWN mount negates both image axes, so |ω⊥| does not depend on it.
 
-    Times are trajectory seconds (t_ns - t0_ns) / 1e9, the axis of `_RowClock` and Trajectory.sample.
-    Rates are interpolated linearly between samples; NaN outside the samples and across gaps longer
-    than `max_gap_s`.
+    Times are trajectory seconds (t_ns - t0_ns) / 1e9, the axis of extract._RowClock and
+    Trajectory.sample. Rates are interpolated linearly between samples (both components, then the
+    norm); NaN outside the samples and inside gaps longer than `max_gap_s` (exactly at a sample: its
+    value).
     """
 
-    def __init__(self, imu: pd.DataFrame, cam_from_device: np.ndarray, t0_ns: int,
+    def __init__(self, imu: pd.DataFrame | None, cam_from_device: np.ndarray, t0_ns: int,
                  max_gap_s: float = GYRO_MAX_GAP_S):
         self.max_gap_s = float(max_gap_s)
         if imu is None or imu.empty or "sensor" not in imu.columns:
@@ -380,18 +418,23 @@ class GyroImageRates:
         keep = np.concatenate([[True], np.diff(t) > 0]) if len(t) else np.zeros(0, bool)
         w_cam = w_dev[keep] @ np.asarray(cam_from_device, dtype=np.float64).T
         self.t = t[keep]
-        self.wx = w_cam[:, 0]
-        self.wy = w_cam[:, 1]
+        self.wx = w_cam[:, 0]          # about image x (right): vertical image motion
+        self.wy = w_cam[:, 1]          # about image y (down): horizontal image motion
 
     def __call__(self, t) -> np.ndarray:
         """|ω⊥| (rad/s) at trajectory time(s) `t`; always an array."""
         t = np.atleast_1d(np.asarray(t, dtype=np.float64))
         out = np.full(t.shape, np.nan)
         n = len(self.t)
-        if n < 2:
+        if n == 0:
+            return out
+        if n == 1:
+            hit = t == self.t[0]
+            out[hit] = math.hypot(self.wx[0], self.wy[0])
             return out
         i = np.clip(np.searchsorted(self.t, t, side="right"), 1, n - 1)
-        ok = (t >= self.t[0]) & (t <= self.t[-1]) & (self.t[i] - self.t[i - 1] <= self.max_gap_s)
+        exact = (self.t[i - 1] == t) | (self.t[i] == t)
+        ok = (t >= self.t[0]) & (t <= self.t[-1]) & ((self.t[i] - self.t[i - 1] <= self.max_gap_s) | exact)
         wx = np.interp(t, self.t, self.wx)
         wy = np.interp(t, self.t, self.wy)
         out[ok] = np.hypot(wx, wy)[ok]
@@ -441,7 +484,8 @@ class FrameScore:
     tier: int                        # 2 x low_light + over_blur_limit; lower is preferred
 
     def key(self) -> tuple[int, float, float]:
-        """Sort key, best first: tier, then sharpest, then nearest (largest c: the segment is closest)."""
+        """Sort key, best first: tier, then sharpest, then nearest (largest c: the segment is closest).
+        On a full tie (only possible at an identical position) the frame offered first is kept."""
         return self.tier, -self.sharpness, -self.info.c
 
 
@@ -492,13 +536,15 @@ class BestFrameSelector:
         sel.offer(info, rgb or None)        # every frame; RGB only where wants() said so
         for res in sel.pop_ready(info.c): ...   # segments whose window c has passed, in order
     and `flush()` at the end, which emits every remaining segment. Each segment is emitted exactly
-    once, in k order, with or without a frame.
+    once, in k order, with or without a frame. Frame times must increase strictly (a frame offered
+    twice is an error) and positions must not decrease (path distance s is monotonic in time).
 
     Choice within a window: tier first (not low-light before low-light; within each, predicted blur
     <= max_blur_px before above it), then the highest sharpness, then the nearest frame (largest c).
     Low-light frames are excluded outright with skip_low_light. Frames in GNSS gaps, black
-    intervals, while reversing or below min_speed_mps are never candidates; they are counted, and
-    a window with only such frames is reported with the most frequent of those reasons.
+    intervals, while reversing or below min_speed_mps (standing still: no progress along s) are never
+    candidates; they are counted, and a window with only such frames is reported with the most
+    frequent of those reasons.
 
     Memory: per open segment the best frame's RGB (by reference: callers must not write into an
     offered array afterwards) and the candidates' sharpness values (for the rank). A segment is open
@@ -507,21 +553,18 @@ class BestFrameSelector:
 
     Several recording sizes (e.g. a thermal step-down from 4K to 1080p between video segments) are
     handled by passing one SegmentGeometry per size; each frame is measured with the geometry of its
-    own size. Windows then use the largest near_m and the smallest far_m, so a candidate shows the
-    whole segment at every size.
+    own size (`geometry_for`). Windows then use the largest near_m and the smallest far_m, so a
+    candidate shows the whole segment at every size.
     """
 
     def __init__(self, segments: Sequence[Segment], geoms: SegmentGeometry | Sequence[SegmentGeometry],
                  cfg: Config | SegmentConfig):
         self.cfg = _seg_cfg(cfg)
         geom_list = [geoms] if isinstance(geoms, SegmentGeometry) else list(geoms)
-        if not geom_list:
-            raise ValueError("BestFrameSelector needs at least one SegmentGeometry")
-        self._geoms: Mapping[tuple[int, int], SegmentGeometry] = {(g.width, g.height): g for g in geom_list}
+        self.near_m, self.far_m = _view_range(geom_list)
+        self._geoms: dict[tuple[int, int], SegmentGeometry] = {(g.width, g.height): g for g in geom_list}
         if len(self._geoms) != len(geom_list):
             raise ValueError("one SegmentGeometry per recording size")
-        self.near_m = max(g.near_m for g in geom_list)
-        self.far_m = min(g.far_m for g in geom_list)
         self.segments = list(segments)
         if [s.k for s in self.segments] != list(range(len(self.segments))):
             raise ValueError("segments must be numbered 0..n-1 in order")
@@ -549,8 +592,20 @@ class BestFrameSelector:
         """Distinct RGB frames currently held (the memory the selector keeps alive)."""
         return len({id(o.rgb) for o in self._open.values() if o.rgb is not None})
 
+    @property
+    def n_emitted(self) -> int:
+        """Segments emitted so far (they are emitted in k order, so these are 0..n_emitted-1)."""
+        return self._next
+
+    def geometry_for(self, width: int, height: int) -> SegmentGeometry:
+        """The SegmentGeometry of a recording size (e.g. FrameScore.width/height of a chosen frame)."""
+        g = self._geoms.get((int(width), int(height)))
+        if g is None:
+            raise KeyError(f"no SegmentGeometry for {width}x{height} (have {sorted(self._geoms)})")
+        return g
+
     def _in_windows(self, c: float) -> range:
-        """Indices of not-yet-emitted segments whose window contains c (windows are ordered)."""
+        """Indices of not-yet-emitted segments whose window contains c (lo and hi are non-decreasing)."""
         a = max(self._next, int(np.searchsorted(self._hi, c, side="left")))
         b = int(np.searchsorted(self._lo, c, side="right"))
         return range(a, max(a, b))
@@ -570,8 +625,9 @@ class BestFrameSelector:
         return None
 
     def wants(self, x: float | FrameInfo) -> bool:
-        """Whether a frame needs its RGB image: its camera position is in an open or future window and,
-        given a FrameInfo, it is not excluded. With a bare position c only the window is checked."""
+        """Whether a frame needs its RGB image: its camera position is in the window of a segment not
+        emitted yet and, given a FrameInfo, it is not excluded. With a bare position c only the
+        window is checked."""
         if self._flushed:
             return False
         if isinstance(x, FrameInfo):
@@ -594,15 +650,15 @@ class BestFrameSelector:
     def offer(self, info: FrameInfo, rgb: np.ndarray | None) -> int:
         """Consider one frame; returns the number of segments it is a candidate for (0 if none).
 
-        Every decoded frame may be offered (frames outside all windows are only used to track
-        position). A candidate must come with its RGB image; excluded frames need none.
+        Every decoded frame may be offered (frames outside all windows only advance the position).
+        A candidate must come with its RGB image; excluded frames need none.
         """
         if self._flushed:
             raise RuntimeError("offer() after flush(): the selector is finished")
         t = _finite(info.t)
         if not t > self._t_last:
             raise ValueError(f"frame time {info.t} is not after the previous frame's {self._t_last}: "
-                             "frames must be offered in time order")
+                             "frames must be offered once each, in time order")
         c = self._advance(_finite(info.c))
         self._t_last = t
         ks = self._in_windows(c)
@@ -616,8 +672,8 @@ class BestFrameSelector:
             return 0
         if rgb is None:
             raise ValueError("a candidate frame was offered without its RGB image (wants() returned True)")
-        geom = self._geoms.get((rgb.shape[1], rgb.shape[0]))
-        if geom is None or rgb.ndim != 3:
+        geom = self._geoms.get((rgb.shape[1], rgb.shape[0])) if rgb.ndim == 3 else None
+        if geom is None:
             raise ValueError(f"no SegmentGeometry for a {rgb.shape} frame (have {sorted(self._geoms)})")
         for k in ks:
             score = self._score(self.segments[k], info, c, geom, rgb)
@@ -653,7 +709,7 @@ class BestFrameSelector:
         return out
 
     def flush(self) -> list[SegmentResult]:
-        """End of the recording: every segment not emitted yet, in order."""
+        """End of the recording: every segment not emitted yet, in order. The selector is then finished."""
         out = [self._emit(k) for k in range(self._next, len(self.segments))]
         self._next = len(self.segments)
         self._flushed = True

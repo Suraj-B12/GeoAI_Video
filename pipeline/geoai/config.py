@@ -167,6 +167,9 @@ class GateConfig:
     crack_mm: float = 300.0            # total crack length inside the segment
     audit_frac: float = 0.10           # rejected segments also sent, to measure the gate's misses
     calibration: str | None = None     # path to gate_calibration.json; its thresholds override the above
+    # Analysis view (full width, far window edge to bottom row) at most this many pixels: S21 4K at 23 deg
+    # would be 6.7 MP at the 2 mm/px target; capped, it scales by ~0.77 (DINOv2 + crack filter ~0.4 s/frame).
+    max_analysis_px: int = 4_000_000
 
 
 @dataclass

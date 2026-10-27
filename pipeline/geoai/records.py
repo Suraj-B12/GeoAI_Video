@@ -1,12 +1,13 @@
-"""Writing crops (PNG with EXIF + embedded metadata), sidecar JSON, CSV and GeoJSON.
+"""Writing crops and segment frames (PNG with EXIF + embedded metadata), sidecar JSON, CSV and GeoJSON.
 
-Crops are PNG, not JPEG: the frames are already video-compressed, and the VLM team measured
+Images are PNG, not JPEG: the frames are already video-compressed, and the VLM team measured
 that re-encoding as JPEG q95 changed the label set on 9 of 49 photos (response notes 1.7).
 PNG adds no further loss and is deterministic.
 
 Metadata is written three ways so no single reader matters: EXIF in the PNG (GPS = camera,
-GPSDest = anomaly centroid), a `geoai` PNG text chunk with the full record, and a sidecar JSON.
-The VLM ignores all of it (it reads pixels only).
+GPSDest = what the image is about: the anomaly centroid of a crop, the centre of a road segment),
+a `geoai` PNG text chunk with the full record, and a sidecar JSON. The VLM ignores all of it (it
+reads pixels only). Segment records, tables and maps are in segment_records.py.
 """
 from __future__ import annotations
 
@@ -180,7 +181,7 @@ class PngPool:
 
 
 def read_png_record(path: Path) -> tuple[dict | None, dict]:
-    """(embedded geoai record, EXIF GPS IFD) of a crop, for checks."""
+    """(embedded geoai record, EXIF GPS IFD) of a crop or segment frame, for checks."""
     with Image.open(path) as im:
         txt = im.text.get("geoai")
         gps = dict(im.getexif().get_ifd(ExifTags.IFD.GPSInfo))

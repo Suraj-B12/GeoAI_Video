@@ -85,6 +85,10 @@ Do these in order. Keep the results with the pilot data.
 - The status panel's **Orientation** row must read **upright ✓**.
   - If it says UPSIDE DOWN, turn the phone 180°. The PC can correct it, but don't rely on that.
   - PORTRAIT sessions are rejected by the PC.
+- Segment mode (one frame per 5 m, [../docs/pipeline/13-segment-frames.md](../docs/pipeline/13-segment-frames.md)) needs the frame to show 6 m of road beyond the nearest visible road. The status panel checks this live from gravity and the survey form's height:
+  - **Tilt**: the camera's angle below the horizon;
+  - **Road in view**: nearest to farthest road along the image's centre column ("60+" with the horizon in view);
+  - **5 m segment** must read **fits**. On the S21's 16:9 4K frame this holds up to about 31° of tilt at 1.35 m (33° at 1.6 m, 36° at 2.0 m), so the steep 45–55° exterior mount suits crop mode only. The pilot mount (23°, 1.35 m) shows 1.45–33 m of road.
 - Take the phone out of its case. Shade it, keep air flowing, and power it with a USB-C PD charger. Keep metal away from the top of the phone (GNSS antenna). Use vibration isolators and a safety tether.
 - Clean the lens before every run.
 
@@ -96,7 +100,7 @@ Do these in order. Keep the results with the pilot data.
    - **Mount:** mount ID, which way the camera faces, nominal height and pitch.
    - **Calibration sessions only:** the target description.
 2. **Prepare:** opens the camera and locks focus and exposure on the road. Keep the vehicle still for a few seconds.
-   - **Focus is set from geometry**, not left to autofocus (`camera/FocusPlanner.kt`): gravity gives the camera's tilt and the survey form gives the mount height. From these the app computes which image rows show road within 4 m and how far away that road is. Focus goes to the dioptre midpoint of that range, so near and far road are equally sharp; on the pilot mount this is about 0.39 dpt (2.6 m).
+   - **Focus is set from geometry**, not left to autofocus (`camera/FocusPlanner.kt`): gravity gives the camera's tilt and the survey form gives the mount height. From these the app computes the road a segment-mode frame must show sharply ([../docs/pipeline/13-segment-frames.md](../docs/pipeline/13-segment-frames.md) §2): from the nearest visible road to 6 m beyond it (a 5 m segment whose near edge is up to 1 m beyond that road), cut at the farthest visible road. Focus goes to the dioptre midpoint of that road's depth range, so its near and far ends are equally sharp. On the pilot mount (23° tilt, 1.35 m) the road is 1.45–7.45 m ahead and focus is 0.34 dpt (3.0 m), with at most 1.7 px of defocus blur at 4K (0.6 px after the VLM's resize). The former 4 m range focused at 0.38 dpt and blurred a segment's far edge by 2.1 px.
    - A five-step sweep (±0.6 dpt) scores the road's sharpness at each setting. It overrides the geometry only if another setting is clearly sharper (by at least 15 %, and at least 0.25 dpt away).
    - Autofocus, metering and the sharpness measure look only at the road rows (the middle 60 % of the width), never at sky, buildings or vehicles.
    - If the lens doesn't report calibrated focus distances, or there is no gravity reading, the app falls back to autofocus on the road area only, then holds that focus.
@@ -197,7 +201,7 @@ In Git Bash, `export MSYS_NO_PATHCONV=1` first, or paths like `/sdcard/...` get 
 ## 11. Test status
 
 **Verified on the Android emulator (API 36):**
-- 16 unit tests (exposure control, frame matching, locale-proof formatting);
+- 44 JVM unit tests (exposure control, frame matching, road focus plan and live mount check, road coverage, locale-proof formatting);
 - sessions validate end to end: checksums, signature, 1:1 frame join, residual < 1 µs, 0 drops;
 - thermal critical stop;
 - crash recovery, with the fragmented MP4 readable to its last fragment;

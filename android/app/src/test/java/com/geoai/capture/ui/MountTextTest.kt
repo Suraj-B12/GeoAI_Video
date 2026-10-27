@@ -18,10 +18,10 @@ class MountTextTest {
 
     @Test fun roadRangeShowsTheHorizonCap() {
         // Pilot mount (numpy): 1.4469-32.2038 m; 5 degrees down: horizon in view, capped at 60 m.
-        assertEquals("1.4-32.2 m ahead", MountText.roadRange(1.4469, 32.2038, tiltKnown = true))
-        assertEquals("2.9-60+ m ahead", MountText.roadRange(2.8858, 60.0, tiltKnown = true))
-        assertEquals("no road in view", MountText.roadRange(null, null, tiltKnown = true))
-        assertEquals("–", MountText.roadRange(null, null, tiltKnown = false))
+        assertEquals("1.4-32.2 m ahead", MountText.roadRange(1.4469, 32.2038, viewKnown = true))
+        assertEquals("2.9-60+ m ahead", MountText.roadRange(2.8858, 60.0, viewKnown = true))
+        assertEquals("no road in view", MountText.roadRange(null, null, viewKnown = true))
+        assertEquals("–", MountText.roadRange(null, null, viewKnown = false))
     }
 
     @Test fun segmentFitNamesTheRoadItNeeds() {

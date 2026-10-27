@@ -20,14 +20,16 @@ import kotlin.math.sqrt
  *    render sharply is therefore `near .. near + `[SEGMENT_REACH_M] ahead, cut at `far`. Crop mode analyses at most
  *    6 m ahead (pipeline geometry.max_range_m), inside the same range, so one plan serves both.
  * 3. A road point d metres ahead lies at depth z = d cos(t) + h sin(t) along the optical axis (t = tilt, h = mount
- *    height), whatever its column and the camera's roll: the depth range is that of the planned road ahead.
+ *    height), whatever its column and the camera's roll: the depth range is that of the planned road ahead, and
+ *    the predicted edge blur holds across the segment's whole width, not only on its centre line.
  * 4. The focus that gives equal, smallest defocus at the nearest and farthest road depth is the dioptre midpoint
  *    D = (1/z_near + 1/z_far) / 2. Blur diameter on the sensor at depth z: A * f * |D - 1/z|, A = f / N.
  *
  * S21 pilot mount (23.0 deg, roll -4.4 deg, 1.35 m; f 5.4 mm, f/1.8, 1.89 um output pixel at 3840 x 2160): road
  * 1.45-7.45 m ahead, depth 1.86-7.38 m, focus 0.337 dpt, edge blur 1.72 output px (0.60 px after the VLM's resize
  * to 1344 x 756). The former 4 m limit focused at 0.378 dpt: 1.20 px on its own 1.5-4 m, but 2.08 px at a
- * segment's far edge (independent calculation with the pipeline camera model; see FocusPlannerTest).
+ * segment's far edge (independent calculation with the pipeline camera model; see FocusPlannerTest). With this
+ * lens and a 16:9 frame a segment fits up to about 31 deg of tilt at 1.35 m (33 deg at 1.6 m, 36 deg at 2.0 m).
  *
  * Pure Kotlin (no Android types) so it is unit-tested on the JVM. Coordinates are sensor active-array pixels.
  */
@@ -80,6 +82,8 @@ object FocusPlanner {
     /**
      * What the recorded frame shows of a flat road along its centre column (the principal point's column), from
      * gravity and the mount height: the pipeline's near_m and far_m (docs/pipeline/13 §2), for the live screen.
+     * The pipeline takes the image's middle column and its own pixel-centre convention; on the pilot sessions the
+     * two agree within 2 mm at the bottom row and 0.5 m at the top row (33-36 m ahead, where a row spans 0.3 m).
      */
     data class RoadView(
         /** Optical axis below the horizontal, degrees (negative: looking up). */
@@ -134,6 +138,12 @@ object FocusPlanner {
         val top = (activeHeight - cropH) / 2
         return top.toInt() to (top + cropH).toInt()
     }
+
+    /**
+     * The optical axis below the horizontal, degrees (negative: looking up), from a TYPE_GRAVITY reading in device
+     * axes; null without a usable reading. It needs no lens data, so the live screen shows it on any camera.
+     */
+    fun tiltDeg(gravity: FloatArray?): Double? = upUnit(gravity)?.let { tiltDegrees(-dot(AXIS, it)) }
 
     /**
      * The road a stream of [outW] x [outH] shows, or null when the geometry can't tell (no gravity, implausible
@@ -196,12 +206,17 @@ object FocusPlanner {
     /** Visible rows [visTop, visBottom) sampled every [step] rows plus the last; [horizonInView]: some row sees no road within the cap. */
     private class Scan(val visTop: Int, val visBottom: Int, val step: Int, val road: List<RoadRow>, val horizonInView: Boolean)
 
-    private fun mount(gravity: FloatArray?, sensorUp: Pair<Double, Double>, heightM: Double): Mount? {
+    /** World up as a unit vector in device axes; null without gravity or with a reading far below 1 g (free fall, bad sensor). */
+    private fun upUnit(gravity: FloatArray?): DoubleArray? {
         val g = gravity ?: return null
-        if (heightM !in 0.3..5.0) return null
         val gn = sqrt(g[0].toDouble() * g[0] + g[1].toDouble() * g[1] + g[2].toDouble() * g[2])
         if (gn < 5.0) return null
-        val up = doubleArrayOf(g[0] / gn, g[1] / gn, g[2] / gn)
+        return doubleArrayOf(g[0] / gn, g[1] / gn, g[2] / gn)
+    }
+
+    private fun mount(gravity: FloatArray?, sensorUp: Pair<Double, Double>, heightM: Double): Mount? {
+        if (heightM !in 0.3..5.0) return null
+        val up = upUnit(gravity) ?: return null
         val axisUp = dot(AXIS, up)
         // "Ahead" = the horizontal projection of the optical axis, as the pipeline's vehicle frame (geometry.py).
         val fwd = doubleArrayOf(AXIS[0] - axisUp * up[0], AXIS[1] - axisUp * up[1], AXIS[2] - axisUp * up[2])
@@ -241,12 +256,15 @@ object FocusPlanner {
     }
 
     private fun view(m: Mount, s: Scan) = RoadView(
-        tiltDeg = Math.toDegrees(asin(m.sinTilt.coerceIn(-1.0, 1.0))),
+        tiltDeg = tiltDegrees(m.sinTilt),
         nearM = s.road.minOfOrNull { it.aheadM },
         farM = if (s.road.isEmpty()) null else if (s.horizonInView) MAX_ROAD_M else s.road.maxOf { it.aheadM },
     )
 
     private fun dot(a: DoubleArray, b: DoubleArray) = a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+    /** Tilt in degrees from its sine (the optical axis's downward component); clamped against rounding past +-1. */
+    private fun tiltDegrees(sinTilt: Double) = Math.toDegrees(asin(sinTilt.coerceIn(-1.0, 1.0)))
 
     /** Defocus blur diameter on the sensor (micrometres) for an object at [depthM] with the lens set to [diopters]. */
     fun blurUm(lens: Lens, diopters: Double, depthM: Double): Double {

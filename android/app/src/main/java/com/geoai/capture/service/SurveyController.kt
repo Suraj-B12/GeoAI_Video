@@ -24,11 +24,17 @@ data class SurveyStatus(
     val focusNote: String = "",
     /** Camera tilt below the horizontal from gravity, degrees (negative: looking up); null without gravity. */
     val tiltDeg: Double? = null,
-    /** Road the recorded frame shows along its centre column, metres ahead of the camera nadir (FocusPlanner.RoadView). */
+    /**
+     * Nearest road the recorded frame shows along its centre column, metres ahead of the camera nadir
+     * (FocusPlanner.RoadView); null when no road is in view or while the view is unknown ([segmentFits] null).
+     */
     val roadNearM: Double? = null,
-    /** Farthest visible road, metres ahead; FocusPlanner.MAX_ROAD_M with the horizon in the frame. */
+    /** Farthest visible road, metres ahead; FocusPlanner.MAX_ROAD_M with the horizon in the frame. Null as [roadNearM]. */
     val roadFarM: Double? = null,
-    /** A 5 m segment plus its 1 m candidate window is in view (near + 6 m <= far); null while the view is unknown. */
+    /**
+     * A 5 m segment plus its 1 m candidate window is in view (near + 6 m <= far); null while the view is unknown
+     * (no camera, gravity or lens data yet), so null also tells "unknown" from "no road in view".
+     */
     val segmentFits: Boolean? = null,
     val exposureNs: Long? = null,
     val iso: Int? = null,

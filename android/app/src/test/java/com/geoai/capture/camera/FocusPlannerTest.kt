@@ -16,8 +16,10 @@ import kotlin.math.tan
  * Geometry and decisions of [FocusPlanner], with the pilot S21's own camera characteristics.
  *
  * Expected numbers marked "numpy" come from an independent calculation with the PIPELINE's camera model
- * (geoai.geometry: K matrix, rotation from gravity via cam_from_device / vehicle_from_camera, pixel_to_ground and
- * ground_to_pixel), sampling the same rows; the zero-roll test also re-derives everything with plane trigonometry.
+ * (geoai.geometry: K matrix from session.json's intrinsics, rotation from gravity via cam_from_device /
+ * vehicle_from_camera, pixel_to_ground; depth = (ground point - camera centre) . camera z axis), sampling the same
+ * active-array rows through the principal point's column. The zero-roll and tilt-limit tests re-derive their
+ * numbers with plane trigonometry instead.
  */
 class FocusPlannerTest {
     // Galaxy S21 main camera as recorded in session.json (26 Oct 2026): active array 4032 x 3024,
@@ -127,6 +129,9 @@ class FocusPlannerTest {
         assertEquals(7.3824, p.farDepthM, 2e-4)
         assertEquals(0.33664, p.targetDiopters, 2e-5)
         assertEquals(1.7244, p.edgeBlurPx, 2e-4)
+        // Metering rows (numpy 838-2556): the road out to near + 6 m, down to the bonnet margin.
+        assertEquals(838, p.roiTop)
+        assertEquals(2556, p.roiBottom)
         // The former plan (road up to 4 m, bottom 4 % excluded) focused at 0.37765 dpt (numpy replica of the old
         // code, which reproduces its 0.3885 dpt for session 1): sharper on 1.5-4 m (1.20 px) but 2.08 px at the
         // segment's far edge and 1.37 px at its near edge.
@@ -134,6 +139,63 @@ class FocusPlannerTest {
         assertEquals(2.0759, blurPx(former, p.farDepthM), 2e-4)
         assertEquals(1.3729, blurPx(former, p.nearDepthM), 2e-4)
         assertTrue(p.edgeBlurPx < blurPx(former, p.farDepthM) - 0.3)
+    }
+
+    @Test fun bothFieldSessionsFitASegmentAndMatchThePipelineView() {
+        // Session-median gravity the pipeline used for the 26 Oct sessions (report.json camera model: R_v_from_c row
+        // 2, the world up in camera axes, mapped back to device axes): 22.998 deg / roll -2.93 and 22.727 / -4.41.
+        val s1 = floatArrayOf(9.01852798461914f, 0.4609531760215759f, 3.832723379135132f)
+        val s2 = floatArrayOf(9.02155590057373f, 0.6952673196792603f, 3.7900185585021973f)
+        // numpy, app rows through the pipeline model: (tilt, near, far, near depth, far depth, target, edge blur).
+        val expected = listOf(
+            s1 to doubleArrayOf(22.997787, 1.445448, 32.657519, 1.858003, 7.381123, 0.3368465, 1.725992),
+            s2 to doubleArrayOf(22.727100, 1.460769, 36.336089, 1.868910, 7.403043, 0.3350754, 1.714250),
+        )
+        // The pipeline's own near_m / far_m (docs/pipeline/13 §2: image middle column, rows H-1 and 0).
+        val pipelineView = listOf(1.446539 to 32.944057, 1.462194 to 36.800171)
+        expected.forEachIndexed { i, (g, e) ->
+            val p = FocusPlanner.plan(s21, g, up90, 1.35, 3840, 2160)!!
+            assertEquals(e[0], p.view.tiltDeg, 1e-4)
+            assertEquals(e[0], FocusPlanner.tiltDeg(g)!!, 1e-4)
+            assertEquals(e[1], p.view.nearM!!, 2e-4)
+            assertEquals(e[2], p.view.farM!!, 2e-3)
+            assertTrue(p.view.segmentFits)
+            assertEquals(e[1] + 6.0, p.farRoadM, 2e-4)
+            assertEquals(e[3], p.nearDepthM, 2e-4)
+            assertEquals(e[4], p.farDepthM, 2e-4)
+            assertEquals(e[5], p.targetDiopters, 2e-6)
+            assertEquals(e[6], p.edgeBlurPx, 2e-4)
+            // What the live screen shows agrees with the view the pipeline will plan its segments with.
+            assertEquals(pipelineView[i].first, p.view.nearM!!, 2e-3)
+            assertEquals(pipelineView[i].second, p.view.farM!!, 0.5)
+        }
+    }
+
+    @Test fun segmentFitsUpTo31DegreesAtThePilotHeight() {
+        // Plane trigonometry with the S21 rows (bottom 20.071 deg below the axis, top 20.655 above), 1.35 m:
+        // near + 6 m - far = -0.0393 m at 31.4 deg (fits) and +0.0241 m at 31.5 deg (does not).
+        val fits = FocusPlanner.roadView(s21, gravity(31.4), up90, 1.35, 3840, 2160)!!
+        assertEquals(1.0750, fits.nearM!!, 2e-4)
+        assertEquals(7.1142, fits.farM!!, 2e-4)
+        assertTrue(fits.segmentFits)
+        val tooSteep = FocusPlanner.roadView(s21, gravity(31.5), up90, 1.35, 3840, 2160)!!
+        assertEquals(1.0711, tooSteep.nearM!!, 2e-4)
+        assertEquals(7.0471, tooSteep.farM!!, 2e-4)
+        assertFalse(tooSteep.segmentFits)
+        // The plan then covers the whole visible road, cut at the top row.
+        val p = FocusPlanner.plan(s21, gravity(31.5), up90, 1.35, 3840, 2160)!!
+        assertEquals(tooSteep.farM!!, p.farRoadM, 0.0)
+    }
+
+    @Test fun tiltNeedsOnlyGravity() {
+        assertEquals(23.0, FocusPlanner.tiltDeg(gravity(23.0, -4.4))!!, 1e-5)
+        assertEquals(25.0757, FocusPlanner.tiltDeg(session1)!!, 1e-4)
+        // Looking up 25.2 degrees; no gravity or a reading far below 1 g gives no tilt.
+        assertEquals(-25.2111, FocusPlanner.tiltDeg(floatArrayOf(8.8279390335083f, 0f, -4.156202793121338f))!!, 1e-4)
+        assertNull(FocusPlanner.tiltDeg(null))
+        assertNull(FocusPlanner.tiltDeg(floatArrayOf(0.1f, 0.1f, 0.1f)))
+        // Straight down: the tilt is known even though "ahead" (and so the road view) is not.
+        assertEquals(90.0, FocusPlanner.tiltDeg(floatArrayOf(0f, 0f, 9.81f))!!, 1e-9)
     }
 
     @Test fun session2FocusWasOutsideTheRoad() {

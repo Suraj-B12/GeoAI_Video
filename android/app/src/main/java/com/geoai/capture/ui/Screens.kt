@@ -513,9 +513,10 @@ private fun StatusPanel(s: SurveyStatus, modifier: Modifier) {
         }, orientColor)
         // Mount check for segment mode: the frame must show road from near to near + 6 m (5 m segment + 1 m window).
         val lookingUp = (s.tiltDeg ?: 0.0) < 0
+        val viewKnown = s.segmentFits != null
         Stat("Tilt", MountText.tilt(s.tiltDeg), if (lookingUp) StatusColors.fail else Color.Unspecified)
-        Stat("Road in view", MountText.roadRange(s.roadNearM, s.roadFarM, s.tiltDeg != null),
-            if (s.tiltDeg != null && s.roadNearM == null) StatusColors.fail else Color.Unspecified)
+        Stat("Road in view", MountText.roadRange(s.roadNearM, s.roadFarM, viewKnown),
+            if (viewKnown && s.roadNearM == null) StatusColors.fail else Color.Unspecified)
         Stat(MountText.segmentLabel, MountText.segment(s.roadNearM, s.segmentFits), when (s.segmentFits) {
             true -> StatusColors.pass
             false -> StatusColors.fail

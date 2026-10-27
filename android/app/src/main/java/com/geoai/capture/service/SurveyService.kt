@@ -24,6 +24,7 @@ import com.geoai.capture.R
 import com.geoai.capture.camera.CameraCatalog
 import com.geoai.capture.camera.CameraRecorder
 import com.geoai.capture.camera.ExposureSetting
+import com.geoai.capture.camera.FocusPlanner
 import com.geoai.capture.camera.FrameMatcher
 import com.geoai.capture.camera.FrameRow
 import com.geoai.capture.camera.SegmentWriter
@@ -878,8 +879,10 @@ class SurveyService : Service() {
                 val ready = gnssReady()
                 maybeAutoStart(ready)
                 val roadNewM = synchronized(coverageLock) { coverage?.newM }
-                // Live mount check: tilt and the road the frame shows, so the operator sees whether a segment fits.
-                val view = recorder?.roadView(focusInputs())
+                // Live mount check (segment mode): the tilt needs only gravity; the road the frame shows, and whether a
+                // segment fits, also need the lens. One gravity reading for both, so the rows never disagree.
+                val mountInputs = focusInputs()
+                val view = recorder?.roadView(mountInputs)
                 update { s ->
                     s.copy(
                         gnssReady = ready,
@@ -903,7 +906,7 @@ class SurveyService : Service() {
                         charging = th?.charging == true,
                         freeGb = freeGb ?: s.freeGb,
                         orientation = verdict.name,
-                        tiltDeg = view?.tiltDeg,
+                        tiltDeg = FocusPlanner.tiltDeg(mountInputs.gravity),
                         roadNearM = view?.nearM,
                         roadFarM = view?.farM,
                         segmentFits = view?.segmentFits,
