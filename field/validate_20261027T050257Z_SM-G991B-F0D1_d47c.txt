@@ -1,0 +1,29 @@
+PASS  spec_version                   1.1
+PASS  boot count                     no reboot during the session
+INFO  session                        20261027T050257Z_SM-G991B-F0D1_d47c type=survey end=user_stop
+PASS  camera timestamp source        REALTIME
+PASS  exposure mode                  MANUAL_SHUTTER_AUTO_ISO
+INFO  streams                        encoder+analysis timestamp base SENSOR
+PASS  mount orientation              UPRIGHT
+PASS  checksums                      14 files match manifest
+PASS  signature                      ECDSA P-256 signature valid for the manifest payload
+PASS  seg_0001.mp4 (hevc 3840x2160)  8970 samples == frames.csv rows
+PASS  seg_0001.mp4 PTS order         strictly increasing, unique
+INFO  seg_0001.mp4 PTS drift         max 1.63 ms vs frames.csv (expected; never use container PTS as time)
+PASS  seg_0002.mp4 (hevc 3840x2160)  6417 samples == frames.csv rows
+PASS  seg_0002.mp4 PTS order         strictly increasing, unique
+INFO  seg_0002.mp4 PTS drift         max 1.32 ms vs frames.csv (expected; never use container PTS as time)
+PASS  frames.csv t_ns                strictly increasing
+PASS  frame metadata join            all 15387 frames matched
+PASS  match residual                 max 1.0 us
+WARN  dropped frames                 30 gaps > 1.5x median (33.33 ms); 0.19%
+INFO  frame rate                     30.00 fps median
+INFO  exposure                       median 1/2703 s, longest 1/1000 s
+PASS  mock locations                 none
+PASS  GNSS brackets video            fixes exist before the first and after the last frame
+INFO  GNSS rate                      1.00 fixes/s during recording
+PASS  GNSS max gap                   1.09 s
+INFO  GNSS accuracy                  median 6.0 m (68%)
+INFO  GNSS fix->receipt              median 4.4 ms (0 ms suggests fixes are stamped on delivery)
+INFO  imu rates                      acc 200 Hz, game_rv 50 Hz, gravity 50 Hz, gyro 200 Hz, mag 50 Hz
+PASS  elapsed-monotonic offset       spread 0.000 ms over 57 samples (non-zero = device slept)
