@@ -20,10 +20,11 @@ from PIL import ExifTags, Image
 
 from geoai.config import Config, GnssConfig
 from geoai.records import build_exif, dms_to_deg, read_png_record, write_png
-from geoai.segment_records import (SEGMENT_CSV_FIELDS, CameraPose, FrameShot, PathPoint, build_segment_record,
-                                   camera_pose, check_segment_png, config_digest, footprint_lonlat, geometry_block,
-                                   load_segment_records, path_points, record_matches_embedded,
-                                   validate_segment_record, write_contact_sheet, write_segment_outputs)
+from geoai.segment_records import (SEGMENT_CSV_FIELDS, CameraPose, FrameShot, MslOffset, PathPoint,
+                                   build_segment_record, camera_pose, check_segment_png, config_digest,
+                                   footprint_lonlat, geometry_block, load_segment_records, path_points,
+                                   record_matches_embedded, validate_segment_record, write_contact_sheet,
+                                   write_segment_outputs)
 from geoai.trajectory import build_trajectory, clean_fixes
 from geoai.util import canonical_json
 
@@ -399,6 +400,37 @@ def test_segment_png_exif_round_trip(tmp_path):
     assert any("GPSDestLatitude" in p for p in problems) and any("embedded record differs" in p for p in problems)
     answered = {**rec, "vlm": {"labels": ["Normal"]}}  # vlm-import adds this to the sidecar only
     assert record_matches_embedded(answered, embedded) == []
+
+
+def test_msl_offset_from_the_phones_fixes():
+    import pandas as pd
+
+    # Hand values: offset = alt_msl - alt_ellipsoid = 86.0 at t = 1 s and 86.4 at t = 11 s after T0.
+    gnss = pd.DataFrame({"t_ns": [T0_NS + 1_000_000_000, T0_NS + 11_000_000_000, T0_NS + 12_000_000_000],
+                         "alt_ellipsoid_m": [785.0, 790.0, ""], "alt_msl_m": [871.0, 876.4, 880.0]})
+    m = MslOffset.from_fixes(gnss, T0_NS)
+    assert m(6.0) == pytest.approx(86.2, abs=1e-9)          # halfway between the two usable fixes
+    assert m(0.0) == pytest.approx(86.0) and m(20.0) == pytest.approx(86.4)   # held outside, not extrapolated
+    assert MslOffset.from_fixes(gnss.drop(columns=["alt_msl_m"]), T0_NS) is None   # no MSL column
+    assert MslOffset.from_fixes(gnss.assign(alt_msl_m=""), T0_NS) is None           # no MSL value
+    assert MslOffset.from_fixes(None, T0_NS) is None
+
+
+def test_msl_altitude_reaches_the_record_and_exif(tmp_path):
+    from dataclasses import replace
+
+    args = record_args(k=7)
+    args["camera"] = replace(args["camera"], alt_msl_m=812.345)
+    rec = build_segment_record(**args)
+    assert rec["camera"]["alt_msl_m"] == 812.345 and rec["camera"]["alt_ellipsoid_m"] == 900.0
+    write_frame(tmp_path, rec)
+    _, gps = read_png_record(tmp_path / rec["frame"]["file"])
+    G = ExifTags.GPS
+    assert gps[G.GPSAltitudeRef] == b"\x00" and float(gps[G.GPSAltitude]) == pytest.approx(812.345, abs=0.005)
+    assert check_segment_png(tmp_path / rec["frame"]["file"], rec, offset_minutes=330) == []
+    wrong = copy.deepcopy(rec)
+    wrong["camera"]["alt_msl_m"] = 812.5   # sidecar no longer matches the PNG's EXIF (nor its embedded record)
+    assert any("GPSAltitude" in p for p in check_segment_png(tmp_path / rec["frame"]["file"], wrong, offset_minutes=330))
 
 
 def test_crop_exif_still_reads_the_anomaly():

@@ -180,17 +180,53 @@ class CameraPose:
     utc_ms: float | None       # None without a UTC fit
     valid: bool
     heading_from_gyro: bool
+    alt_msl_m: float | None = None  # mean-sea-level altitude, None when the phone reported none
 
 
-def camera_pose(traj: Trajectory, t_s: float) -> CameraPose:
-    """The trajectory sampled at `t_s`, with WGS-84 position and UTC."""
+class MslOffset:
+    """MSL altitude minus ellipsoidal height at a trajectory time, from the phone's own fixes.
+
+    Android (API 34+) reports both heights with every fix (gnss_fixes.csv `alt_ellipsoid_m`,
+    `alt_msl_m`). Their difference is the phone's geoid model at that place (about +86 m around
+    Bengaluru: the geoid lies below the ellipsoid), which changes by centimetres per kilometre, so it
+    is interpolated linearly in time (held at the end values outside the fixes) and added to the
+    trajectory's ellipsoidal height. That gives the camera's MSL altitude, as docs/pipeline/08 §1 asks,
+    without a geoid grid here; the two heights are never substituted for each other.
+    """
+
+    def __init__(self, t_s: np.ndarray, offset_m: np.ndarray):
+        self.t_s, self.offset_m = t_s, offset_m
+
+    @classmethod
+    def from_fixes(cls, gnss, t0_ns: int) -> "MslOffset | None":
+        """From Session.gnss; None when no fix carries both heights (older Android, other sources)."""
+        import pandas as pd  # see the module docstring: only numpy is imported at module level
+
+        cols = ("t_ns", "alt_ellipsoid_m", "alt_msl_m")
+        if gnss is None or not all(c in getattr(gnss, "columns", ()) for c in cols):
+            return None
+        d = gnss[list(cols)].apply(pd.to_numeric, errors="coerce").dropna().sort_values("t_ns", kind="stable")
+        if d.empty:
+            return None
+        t = (d["t_ns"].to_numpy(dtype=np.int64) - np.int64(t0_ns)) / 1e9
+        off = d["alt_msl_m"].to_numpy(dtype=np.float64) - d["alt_ellipsoid_m"].to_numpy(dtype=np.float64)
+        keep = np.concatenate([[True], np.diff(t) > 0])
+        return cls(t[keep], off[keep])
+
+    def __call__(self, t_s: float) -> float:
+        return float(np.interp(float(t_s), self.t_s, self.offset_m))
+
+
+def camera_pose(traj: Trajectory, t_s: float, msl: MslOffset | None = None) -> CameraPose:
+    """The trajectory sampled at `t_s`, with WGS-84 position, UTC and (given `msl`) MSL altitude."""
     t = float(t_s)
     p = traj.sample(np.array([t]))
     lat, lon, alt = (np.atleast_1d(v) for v in traj.enu_to_geodetic(p["e"], p["n"], p["u"]))
     utc = float(traj.utc.utc_ms(t)) if traj.utc is not None else None
+    alt_msl = float(alt[0]) + msl(t) if msl is not None else None
     return CameraPose(t, float(p["s"][0]), float(p["e"][0]), float(p["n"][0]), float(lat[0]), float(lon[0]),
                       float(alt[0]), float(p["heading"][0]), float(p["speed"][0]), float(p["h_sigma"][0]), utc,
-                      bool(p["valid"][0]), bool(p["heading_from_gyro"][0]))
+                      bool(p["valid"][0]), bool(p["heading_from_gyro"][0]), alt_msl)
 
 
 def footprint_lonlat(traj: Trajectory, ring_xy, pose: CameraPose) -> list[list[float]]:
@@ -310,7 +346,7 @@ def build_segment_record(*, session_id: str, session_meta: Mapping[str, Any], se
                  "near_edge_ahead_m": float(shot.near_edge_ahead_m), "far_edge_ahead_m": float(shot.far_edge_ahead_m)}
         rearward = str((session_meta.get("mount") or {}).get("camera_facing") or "forward") == "rearward"
         cam = {"lat": camera.lat, "lon": camera.lon, "alt_ellipsoid_m": _num(camera.alt_ellipsoid_m),
-               "alt_msl_m": None,  # no geoid model here; never the ellipsoidal height (docs/pipeline/08 §2)
+               "alt_msl_m": _num(camera.alt_msl_m),  # the phone's MSL, never the ellipsoidal height (08 §2)
                "heading_deg": _wrap360(camera.heading_deg),
                "view_direction_deg": _wrap360(camera.heading_deg + (180.0 if rearward else 0.0)),
                "speed_mps": camera.speed_mps, "h_sigma_m": camera.h_sigma_m, "utc_ms": utc}
@@ -731,6 +767,17 @@ def check_segment_png(path: Path, sidecar: Mapping[str, Any], *, offset_minutes:
         p.append("EXIF GPSDestDistance differs from target.distance_m")
     if G.GPSDestBearing not in gps or bearing is None or abs(float(gps[G.GPSDestBearing]) - bearing) > 0.006:
         p.append("EXIF GPSDestBearing differs from target.bearing_deg")
+    # GPSAltitude is the MSL altitude to 0.01 m (records.build_exif), written only when the record has one.
+    msl = _num(cam.get("alt_msl_m"))
+    if msl is None:
+        if G.GPSAltitude in gps:
+            p.append("EXIF GPSAltitude is set although the record has no MSL altitude")
+    elif G.GPSAltitude not in gps:
+        p.append("EXIF GPSAltitude missing")
+    else:
+        got = float(gps[G.GPSAltitude]) * (-1.0 if gps.get(G.GPSAltitudeRef) in (b"\x01", 1) else 1.0)
+        if abs(got - msl) > 0.006:
+            p.append(f"EXIF GPSAltitude {got} differs from camera.alt_msl_m {msl}")
     if exif.get(ExifTags.Base.ImageUniqueID) != unique_id(sidecar["id"]):
         p.append("EXIF ImageUniqueID does not derive from the record id")
     if frame.get("utc_ms") is not None:

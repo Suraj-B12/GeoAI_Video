@@ -43,9 +43,9 @@ from .gate import SegmentGate, gate_far_m, plan_segment_view
 from .geometry import CameraModel, cam_from_device, nominal_model
 from .records import PngPool, utc_strings
 from .runlog import RunLog
-from .segment_records import (SENT_STATUSES, STATUSES, FrameShot, build_segment_record, camera_pose, config_digest,
-                              footprint_lonlat, geometry_block, path_points, segment_id, write_contact_sheet,
-                              write_segment_outputs)
+from .segment_records import (SENT_STATUSES, STATUSES, FrameShot, MslOffset, build_segment_record, camera_pose,
+                              config_digest, footprint_lonlat, geometry_block, path_points, segment_id,
+                              write_contact_sheet, write_segment_outputs)
 from .segments import (BestFrameSelector, FrameInfo, GyroImageRates, SegmentGeometry, SegmentResult, plan_offset_m,
                        plan_segments)
 from .session import Session
@@ -420,6 +420,7 @@ class _Decode:
         cam = s.meta.get("camera", {}) or {}
         so = int(cam.get("sensor_orientation_deg") or (s.meta.get("orientation") or {}).get("sensor_orientation_deg") or 90)
         self.gyro = GyroImageRates(s.imu, cam_from_device(so), s.t0_ns)
+        self.msl = MslOffset.from_fixes(s.gnss, s.t0_ns)  # camera MSL altitude (EXIF GPSAltitude)
         self.pool = PngPool()
         self.records: list[dict] = []
         self.results: list[SegmentResult] = []
@@ -485,7 +486,7 @@ class _Decode:
             scores = r.gate.score(res.rgb, b.info.c, b.rows)
             self.t_gate += time.perf_counter() - t
             gate = r.gate.decide(scores, rid)
-            pose = camera_pose(traj, b.info.t)
+            pose = camera_pose(traj, b.info.t, self.msl)
             ring = r.geom.footprint(b.near_edge_ahead_m, b.far_edge_ahead_m)
             shot = FrameShot(b.info.ref, b.width, b.height, b.rows, b.near_edge_ahead_m, b.far_edge_ahead_m,
                              b.info.low_light)

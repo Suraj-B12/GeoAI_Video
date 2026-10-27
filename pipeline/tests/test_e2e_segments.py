@@ -169,6 +169,13 @@ def test_sidecars_valid_pngs_match_and_frames_are_the_video_frames(sim):
     assert sent
     for r in recs:
         assert validate_segment_record(r) == [], r["id"]
+    covered = [r for r in recs if r["status"] != "not_covered"]
+    # Every best frame is its own place: distinct camera positions and segment centres.
+    assert len({(r["camera"]["lat"], r["camera"]["lon"]) for r in covered}) == len(covered)
+    assert len({(r["segment"]["centre"]["lat"], r["segment"]["centre"]["lon"]) for r in recs}) == len(recs)
+    # MSL altitude from the phone's fixes: the simulator writes alt_msl = alt_ellipsoid + 86 m (sim.py).
+    for r in covered:
+        assert r["camera"]["alt_msl_m"] - r["camera"]["alt_ellipsoid_m"] == pytest.approx(86.0, abs=1e-3), r["id"]
     for r in sent:
         png = run / r["frame"]["file"]
         assert check_segment_png(png, r, offset_minutes=330) == [], r["id"]

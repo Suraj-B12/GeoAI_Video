@@ -35,6 +35,7 @@ from .dinov2 import PATCH, PatchFeatures
 from .geometry import CameraModel, nominal_model
 from .qwen import CropPlan, frame_input_size, plan_crop
 from .records import PngPool, unique_id, utc_strings, write_csv, write_geojson, write_sidecar
+from .segment_records import MslOffset
 from .session import Session
 from .trajectory import Trajectory, build_trajectory, clean_fixes
 from .util import log, write_json_atomic
@@ -316,6 +317,7 @@ def process_session(session_dir: Path, out_root: Path, cfg: Config, *, allow_tes
     selected = 0
     frame_stats = []
     pool = PngPool()
+    msl = MslOffset.from_fixes(s.gnss, t0)  # camera MSL altitude from the phone's fixes (EXIF GPSAltitude)
     for seg, path in seg_files.items():
         res = seg_res[seg]
         v = views[res]
@@ -347,7 +349,7 @@ def process_session(session_dir: Path, out_root: Path, cfg: Config, *, allow_tes
             cands, diag = det.detect(ana, s_anchor, v.gsd_rows_mm)
             frame_stats.append({"frame_global": int(fr.row["frame_global"]), "s_m": s_anchor, **diag,
                                 "candidates": len(cands), "band_len": v.band_len})
-            frame_recs = _frame_records(fr, v, cands, t_mid, s_anchor, traj, s, cfg, clock, frame_order)
+            frame_recs = _frame_records(fr, v, cands, t_mid, s_anchor, traj, s, cfg, clock, frame_order, msl)
             if frame_recs:
                 frame_id = f"{s.session_id}_{int(fr.row['frame_global']):07d}_frame"
                 frame_recs = _merge_in_frame(frame_recs, v, cfg)
@@ -449,7 +451,8 @@ def _contact_sheet(out: Path, recs: list[dict], cell: int = 256, cols: int = 8) 
 
 
 def _frame_records(fr, v: View, cands: list[Candidate], t_mid: float, s_anchor: float, traj: Trajectory,
-                   s: Session, cfg: Config, clock: _RowClock, frame_order: int) -> list[_Rec]:
+                   s: Session, cfg: Config, clock: _RowClock, frame_order: int,
+                   msl: MslOffset | None = None) -> list[_Rec]:
     out: list[_Rec] = []
     model = v.model
     tol = cfg.extract.band_tolerance_m
@@ -520,7 +523,7 @@ def _frame_records(fr, v: View, cands: list[Candidate], t_mid: float, s_anchor: 
             "t_ns": int(fr.row["t_ns"]), "utc_ms": utc_c,
             **({k2: v2 for k2, v2 in utc_strings(utc_c, cfg.output.utc_offset_minutes).items() if k2 in ("utc_iso", "local_iso")} if utc_c else {}),
             "camera": {"lat": float(clat[0]), "lon": float(clon[0]), "alt_ellipsoid_m": float(calt[0]),
-                       "alt_msl_m": None, "heading_deg": float(cam["heading"][0]), "view_direction_deg": view_dir,
+                       "alt_msl_m": float(calt[0]) + msl(t_mid) if msl is not None else None, "heading_deg": float(cam["heading"][0]), "view_direction_deg": view_dir,
                        "speed_mps": float(cam["speed"][0]), "h_sigma_m": float(cam["h_sigma"][0]),
                        "utc_ms": utc_mid},
             "anomaly": {"lat": float(alat[0]), "lon": float(alon[0]), "sigma_m": sigma,
