@@ -19,6 +19,7 @@
 # --- field data and pipeline outputs (large; copied by USB, not git) ---
 field/sessions/
 field/runs/
+field/runs_*/
 field/batches/
 runs/
 batches/
