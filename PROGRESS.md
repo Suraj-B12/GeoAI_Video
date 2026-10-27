@@ -18,30 +18,13 @@ Updated as work lands. If a session ends mid-task, a new session can continue fr
 - **Field test, 26 Oct:** two S21 sessions validated (`field/validate_*.txt`); focus diagnosis in `field/focus_diagnosis.md`.
 - **Research record:** Claude Doc https://claude.ai/artifact/5GroudyCievFkTPWUjgwCA
 
-**In progress: segment mode** (spec: `docs/pipeline/13-segment-frames.md`). One best full frame per 5 m of road; a frame-level distress check on the segment; the full frame goes to the VLM. Config sections `segments` and `gate` are already in `pipeline/geoai/config.py`.
+**Handed off on 27 Oct 2026.** Segment mode is in progress. Follow `docs/HANDOFF_PLAN.md`; the rules are in `CLAUDE.md`.
 
-| Part | Files | Status |
-|---|---|---|
-| Segment planning + best-frame selection | `pipeline/geoai/segments.py`, `tests/test_segments.py` | to build |
-| Distress check + calibration | `pipeline/geoai/gate.py`, `AnomalyDetector.maps()` in `anomaly.py`, `tests/test_gate.py` | to build |
-| Records, EXIF, VLM export/import, analysis | `segment_records.py`, `vlm.py`, `analyze.py`, `records.py`, `tools/run_vlm_batch.py`, tests | to build |
-| Orchestrator + CLI | `pipeline/geoai/frames.py`, `cli.py` (`process --mode segments`, `gate-calibrate`, `analyze`), end-to-end simulator test | to build |
-| App: focus range for 5 m segments, live tilt and road-range display | `android/.../FocusPlanner.kt`, `Screens.kt` | to build |
-| VLM PC instructions | `docs/VLM_PC_SETUP.md` | to write |
-| Run on both 26 Oct sessions; review; push | - | after the above |
-
-## Paused 27 Oct 2026 (user asked to pause)
-
-The parallel build workflow (run `wf_6a63583d-206`) was stopped before any builder finished. Its partial work is committed on branch `wip/segment-mode`, not on `main`:
-- `pipeline/geoai/segments.py` (selector, partial);
-- edits to `pipeline/geoai/anomaly.py` (gate `maps()`, partial) and `pipeline/geoai/records.py` (EXIF target, partial);
-- app edits (FocusPlanner range, tilt display, `MountText.kt`, partial).
-
-To resume, re-launch the four builders with the same prompts. Each one first reads the partial files it owns, finishes them and runs its tests. Then come the integrator, the review, the real-session runs and the merge to `main`.
-
-## How to resume
-
-1. Read `docs/pipeline/13-segment-frames.md`, which is the contract.
-2. Run `python -m pytest -m "slow or not slow"` in `pipeline/`; it must stay green.
-3. Build each missing part in the table, with its tests.
-4. Commit and push to https://github.com/Suraj-B12/GeoAI_Video. No images or videos (see `.gitignore`); no co-author trailer in commit messages.
+| Part | Status |
+|---|---|
+| App focus range for 5 m segments, live tilt and road-range display | done; 44 app tests pass |
+| `segments.py`, `gate.py` (+ `anomaly.maps`), `segment_records.py`, `vlm.py`/`run_vlm_batch.py`, `analyze.py` | drafted with unit tests; builders were cut off by usage limits; review per HANDOFF_PLAN step 1 |
+| Fast suite | 185 passed, 1 failed (`test_analyze.py::test_segment_export_contents`), 2 skipped |
+| `frames.py` + CLI + simulator end-to-end + real runs | not started (HANDOFF_PLAN step 2) |
+| `docs/VLM_PC_SETUP.md` | not started (step 4) |
+| Local Postgres, local image store, operator_ui `video_pipeline` toggle, cleanup | not started (steps 5–6) |
