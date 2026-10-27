@@ -397,9 +397,12 @@ class Answers:
 
 
 def _labels(resp: dict) -> list[str]:
+    """The answer's labels. /classify runs Stage 2 only on frames Stage 1 called Distress; for a frame
+    Stage 1 called Normal it returns stage1_label "Normal" and an empty distress_types (the VLM
+    system's PavementClassifier.predict), and that answer is the label Normal."""
     v = resp.get("distress_types")
-    if v is None:
-        return []
+    if not v:
+        return ["Normal"] if str(resp.get("stage1_label") or "").strip().lower() == "normal" else []
     if isinstance(v, str):
         v = [x.strip() for x in v.split(",") if x.strip()]
     out = []
@@ -529,9 +532,16 @@ def health_identity(run_info: Mapping[str, Any], cfg: Config) -> dict:
         model_ok = exp_model == model or exp_model.startswith(model + "/")
     else:
         model_ok = model == exp_model.split("@")[0]
+    # The VLM system's /health reports prompts_version as the name alone ("v2"), without the prompt id
+    # after the colon: such a value can match only by name, like a model without "@revision".
+    if prompt is None:
+        prompt_ok = None
+    elif ":" in prompt:
+        prompt_ok = prompt == exp_prompt
+    else:
+        prompt_ok = prompt == exp_prompt.split(":")[0]
     return {"model_reported": model, "prompt_version_reported": prompt, "model_matches": model_ok,
-            "prompt_matches": None if prompt is None else prompt == exp_prompt,
-            "consistent": len(set(ids)) <= 1}
+            "prompt_matches": prompt_ok, "consistent": len(set(ids)) <= 1}
 
 
 def _first_str(d: Mapping[str, Any], keys: Sequence[str]) -> str | None:

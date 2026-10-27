@@ -339,9 +339,16 @@ def run(d: Path, a) -> int:
         print(f"STOP: GET /health returned {status}: {health}", file=sys.stderr)
         return 2
     said = json.dumps(health)
+    # The server may report the model without "@revision" and the prompt version without ":<prompt id>"
+    # (the VLM system's /health says "prompts_version": "v2"). A name as short as "v2" must be a whole
+    # JSON value, or the start of one, so that it is not found inside another word.
+    prompt = str(batch.get("expected_prompt_version") or "").split(":")[0]
+    model = str(batch.get("expected_model_id") or "").split("@")[0]
+    found = {"expected_prompt_version": f'"{prompt}"' in said or f'"{prompt}:' in said,
+             "expected_model_id": model in said}
     for key, what in (("expected_prompt_version", "prompt version"), ("expected_model_id", "model")):
         want = str(batch.get(key) or "")
-        if want and want.split("@")[0] not in said:
+        if want and not found[key]:
             print(f"WARNING: /health does not mention the expected {what} {want!r}: {said[:300]}", file=sys.stderr)
 
     run_path = d / "vlm_run.json"

@@ -11,7 +11,7 @@ import pytest
 
 from geoai.config import Config
 from geoai.records import write_png, write_sidecar
-from geoai.vlm import export_batch, import_batch, verify_sums
+from geoai.vlm import _parse, answer_class, export_batch, health_identity, import_batch, verify_sums
 
 RUNNER = Path(__file__).resolve().parent.parent / "tools" / "run_vlm_batch.py"
 
@@ -110,7 +110,7 @@ def test_round_trip_with_resume(tmp_path, server):
 
     summary = import_batch(batch, [run], Config())
     assert summary["answered"] == 6 and summary["missing"] == 0
-    assert summary["valid"] == 4  # "N/A" (crop 30) and the empty frame-30 answer are not valid labels
+    assert summary["valid"] == 5  # "N/A" (crop 30) is not a valid label; frame 30 (Stage 1 Normal, no Stage 2) is Normal
     rows = (run / "vlm_results_batch_001.csv").read_text(encoding="utf-8-sig").splitlines()
     assert len(rows) == 4  # header + 3 crops
     by_id = {r.split(",")[0]: r for r in rows[1:]}
@@ -133,3 +133,31 @@ def test_runner_refuses_altered_batch(tmp_path, server):
     assert r.returncode == 2 and "SHA256SUMS" in r.stderr
     with pytest.raises(ValueError):
         import_batch(batch, [run], Config())
+
+
+# What the VLM system's server really returns (its PavementClassifier.predict and GET /health), not a fake's
+# idealised version: an answer for every Stage 1 outcome, and its /health identity fields.
+@pytest.mark.parametrize("resp, cls, labels, valid", [
+    ({"stage1_label": "Normal", "distress_types": [], "severity": "None"}, "normal", ["Normal"], True),
+    ({"stage1_label": "Distress", "distress_types": ["Potholes", "Ravelling"]}, "distress", ["Potholes", "Ravelling"], True),
+    ({"stage1_label": "Distress", "distress_types": []}, "unknown", [], False),   # Stage 2 named nothing
+    ({"stage1_label": "Normal", "distress_types": ["N/A"]}, "unknown", ["N/A"], False),  # Stage 2 forced on Normal
+    ({}, "unknown", [], False),
+])
+def test_answer_of_each_server_outcome(resp, cls, labels, valid):
+    allowed = set(Config().vlm.labels)
+    res = _parse({"response": resp}, {"request_id": "r", "kind": "segment"}, allowed)
+    assert res["labels"] == labels and res["valid"] is valid
+    assert answer_class(res, allowed) == (cls, [lab for lab in labels if lab in allowed and lab != "Normal"])
+
+
+def test_health_identity_of_the_real_server():
+    cfg = Config()
+    real = {"model_name": "Qwen/Qwen2.5-VL-7B-Instruct", "prompts_version": "v2", "quantization_bits": 4}
+    assert health_identity({"health": real}, cfg) == {
+        "model_reported": "Qwen/Qwen2.5-VL-7B-Instruct", "prompt_version_reported": "v2", "model_matches": True,
+        "prompt_matches": True, "consistent": True}
+    ident = health_identity({"health": dict(real, prompts_version="v1")}, cfg)
+    assert ident["prompt_matches"] is False
+    assert health_identity({"health": dict(real, prompts_version="v2:0000000000000000")}, cfg)["prompt_matches"] is False
+    assert health_identity({"health": {}}, cfg)["prompt_matches"] is None

@@ -47,7 +47,8 @@ SEGS_B = [(0, "send", "send", 5.0, False), (1, "send", "skip", 5.0, False), (2, 
           (3, "send", "audit", 5.0, False), (4, "send", "skip", 5.0, False), (5, "send", "send", 5.0, False),
           (6, "send", "send", 5.0, False), (7, "not_covered", None, 5.0, False)]
 MODES = {"SESS_A": "gate", "SESS_B": "all"}
-# The VLM's answers (distress_types as the server returns them) and what they must mean.
+# The VLM's answers (distress_types as the server returns them) and what they must mean. [] is what /classify
+# returns when Stage 1 says Normal: Stage 2 never runs, stage1_label is "Normal" and distress_types is empty.
 ANSWERS = {
     ("SESS_A", 0): (["Potholes"], "distress", ["Potholes"]),
     ("SESS_A", 1): ("Alligator Cracking, Longitudinal Cracking", "distress", ["Alligator Cracking", "Longitudinal Cracking"]),
@@ -57,11 +58,11 @@ ANSWERS = {
     ("SESS_A", 8): (["Normal"], "normal", []),
     ("SESS_A", 11): (["N/A"], "unknown", []),                                 # no valid label
     ("SESS_B", 0): (["Normal", "Potholes"], "distress", ["Potholes"]),        # mixed: flagged, distress counts
-    ("SESS_B", 1): (["Normal"], "normal", []),
+    ("SESS_B", 1): ([], "normal", []),
     ("SESS_B", 2): (["Hairline Cracks"], "distress", ["Hairline Cracks"]),
     ("SESS_B", 3): (["Transverse Cracking"], "distress", ["Transverse Cracking"]),
     ("SESS_B", 4): (["Edge Cracking"], "distress", ["Edge Cracking"]),
-    ("SESS_B", 5): (["Normal"], "normal", []),
+    ("SESS_B", 5): ([], "normal", []),
 }
 VALID = {("SESS_A", 0), ("SESS_A", 1), ("SESS_A", 2), ("SESS_A", 7), ("SESS_A", 8), ("SESS_B", 1), ("SESS_B", 2),
          ("SESS_B", 3), ("SESS_B", 4), ("SESS_B", 5)}
@@ -129,6 +130,8 @@ def write_answers(batch: Path) -> list[dict]:
                             [("SESS_B", k) for k in range(6)]):
         resp = {"stage1_label": "Distress", "stage1_confidence": 0.9, "distress_types": ANSWERS[key][0],
                 "severity": "Medium", "stage2_confidence": 0.8, "needs_expert_review": False, "description": "d"}
+        if ANSWERS[key][0] == []:  # Stage 1 Normal, exactly as the VLM system's predict() builds it
+            resp.update(stage1_label="Normal", severity="None", stage2_confidence=0.0, description="")
         ln = _line(rid(*key), 10.0 + i, stamp(), resp)
         lines.append(ln)
         ok.append(ln)
@@ -185,14 +188,17 @@ def test_segment_export_contents(answered_batch):
     assert (info["n_crops"], info["n_frames"]) == (0, 0) and info["sessions"] == ["SESS_A", "SESS_B"]
     assert info["records_by_status"] == {"send": 12, "audit": 2, "skip": 4, "not_covered": 2}
     assert info["requests_by_status"] == {"send": 12, "audit": 2}
-    assert info["model_input_sizes"] == {"112x63": [112, 56]}  # Qwen smart_resize: 63 -> 56, 112 stays
+    # Qwen smart_resize with the server's min_pixels 256 x 28 = 7168 (the VLM system's MIN_IMAGE_PIXELS default):
+    # rounding gives 112 x 56 = 6272 px, below the minimum, so both sides scale by sqrt(7168 / (112 x 63)) and
+    # round up to multiples of 28: 63 -> 84, 112 -> 140 (transformers' own smart_resize gives the same).
+    assert info["model_input_sizes"] == {"112x63": [140, 84]}
     assert "resizes it itself" in info["image_rules"] and info["not_exported"] == [] and info["reencoded"] == []
     reqs = [json.loads(x) for x in (batch / "requests.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [r["request_id"] for r in reqs] == [rid(r["sid"], r["k"]) for r in sent]  # route order per session
     for r in reqs:
         src = runs[r["session_id"]] / "frames" / f"{r['request_id']}.png"
         img = batch / r["image"]
-        assert r["kind"] == "segment" and r["record_id"] == r["request_id"] and r["model_input"] == [112, 56]
+        assert r["kind"] == "segment" and r["record_id"] == r["request_id"] and r["model_input"] == [140, 84]
         assert img.read_bytes() == src.read_bytes() and r["image_sha256"] == sha256_file(src)
     # Every record of every status travels with the batch, exactly as extracted.
     copied = sorted(p.name for p in (batch / "records").glob("*.json"))
@@ -203,7 +209,7 @@ def test_segment_export_contents(answered_batch):
         assert (batch / "runs" / sid / "report.json").read_bytes() == (run / "report.json").read_bytes()
     assert verify_sums(batch) == []
     running = (batch / "RUNNING.txt").read_text(encoding="utf-8")
-    assert "14 road-segment frames from 2 session(s)" in running and "112x63 -> 112x56" in running
+    assert "14 road-segment frames from 2 session(s)" in running and "112x63 -> 140x84" in running
 
 
 def test_segment_export_refusals_leave_no_batch(tmp_path):

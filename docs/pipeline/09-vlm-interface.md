@@ -11,6 +11,8 @@ Implementation: [`geoai/vlm.py`](../../pipeline/geoai/vlm.py), [`tools/run_vlm_b
 - Served by FastAPI: `POST /classify` (multipart field `file`) returns JSON (`stage1_label`, `stage1_confidence`, `distress_types`, `severity`, `description`, `stage2_confidence`, `needs_expert_review`, raw outputs, timings). `GET /health` reports the model, prompt version and settings. The rate limit is 10 requests per minute per client.
 - Metadata is ignored: no EXIF, nothing in the prompt. It reads pixels only.
 - Valid labels are the 18 IRC:82-2015 names plus `Normal`. Anything else (`N/A`, `Unknown`) means "no valid label".
+- Stage 2 runs only on images Stage 1 called Distress. For the others the server returns `stage1_label: "Normal"` with an empty `distress_types`; the import reads that answer as the label `Normal`. An empty `distress_types` after a Stage 1 Distress is "no valid label".
+- `GET /health` reports `model_name` without a revision and `prompts_version` as the name alone (`v2`), so the import and the runner match those by name; a value with a revision or prompt id must match exactly.
 
 ## 2. Hand-off
 
