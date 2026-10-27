@@ -44,7 +44,7 @@ The mount is bolted and cannot be tilted further down, so the design works with 
   - the Hessian crack filter.
 - **Scores restricted to the segment's patches** (rows of `[s0, s1)` in the analysis image, all columns): `probe_frac`, `probe_max_logit`, `evidence` (bank and crack candidates whose centroid lies in the segment), `crack_mm`, `z_max`, `anomalous_patch_frac`, `n_patches`.
 - **Decision:** `send` when any of `probe_frac`, `evidence`, `crack_mm` reaches its threshold (`GateConfig`). Otherwise `audit` for a deterministic `audit_frac` of segments (SHA-256 of the record id), or `skip`. With `mode = all`, every covered segment is `send` and the gate's would-be decision is still recorded (`gate.decision_if_gated`).
-- **Calibration** (`geoai gate-calibrate BATCH...`, `gate.calibrate()`): from segments the VLM answered, with VLM distress = any valid non-Normal label, it finds, for each signal and for the any-of rule, the thresholds that keep `target_recall` (0.9) of the VLM-positive segments at the lowest pass rate. It writes `gate_calibration.json`, including the curves; `GateConfig.calibration` loads it. No labels by us: the VLM is the reference, and that caveat is written into every output.
+- **Calibration** (`geoai gate-calibrate BATCH... [--target-recall 0.9] [--out FILE]`, default `FILE` = `gate_calibration.json` in the first batch; `gate.calibrate()`): from segments the VLM answered, with VLM distress = any valid non-Normal label, it finds, for each signal and for the any-of rule, the thresholds that keep `target_recall` (0.9) of the VLM-positive segments at the lowest pass rate. It writes `gate_calibration.json`, including the curves; `GateConfig.calibration` loads it. No labels by us: the VLM is the reference, and that caveat is written into every output.
 
 ## 5. Records and files
 
@@ -80,6 +80,10 @@ device    manufacturer, model, device_id;  geometry  source, pitch_deg, roll_deg
 flags     low_light, geometry_nominal, latency_uncorrected, heading_from_gyro, partial, ...
 vlm       (added by vlm-import) labels[], stage1_label, stage1_confidence, severity, description, valid, problem
 ```
+
+`gate.thresholds` holds the thresholds in force (numbers, or null for a signal that is off: `probe_frac`, `evidence`, `crack_mm`, `audit_frac`, `probe_seed_logit`) and three provenance texts: `source` (`config` or `calibration`) and, with a calibration, `calibration_file` and `calibration_sha256`. Every record therefore names what decided it.
+
+Beside the run folder, every `process` run appends a structured log, `<out>/logs/<UTC date>/<session>.jsonl` (one JSON object per line: stage, start/end/error, wall time, counts, stack traces). Reruns give byte-identical run folders except for `report.json`'s `created_utc` and `timings_s`.
 
 **EXIF** (`records.build_exif`): GPS = camera position, speed, heading, horizontal error, UTC date and time; GPSDest = segment centre (bearing, distance); DateTimeOriginal with sub-seconds and offset (IST); Make, Model, Software; ImageUniqueID. `build_exif` reads `rec["target"]` (segment mode) or `rec["anomaly"]` (crop mode).
 

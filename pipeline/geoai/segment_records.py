@@ -70,6 +70,9 @@ GATE_SCORE_FIELDS = ("probe_frac", "probe_max_logit", "evidence", "crack_mm", "z
 SURVEY_FIELDS = ("road_id", "road_name", "direction", "lane", "start_chainage_km", "operator", "vehicle", "weather")
 DEVICE_FIELDS = ("manufacturer", "model", "device_id")
 GEOMETRY_FIELDS = ("source", "pitch_deg", "roll_deg", "height_m")
+# gate.thresholds holds numbers (or null = signal off), except these provenance texts (gate.gate_thresholds): where
+# the thresholds came from (config | calibration) and which calibration file, so every record names its decider.
+THRESHOLD_TEXT_FIELDS = ("source", "calibration_file", "calibration_sha256")
 # Added by vlm-import, only to segments the VLM answered: the spec's seven fields, the second confidence
 # and the review flag that /classify also returns, and the batch the answer came from.
 VLM_FIELDS = ("labels", "stage1_label", "stage1_confidence", "severity", "description", "valid", "problem",
@@ -572,8 +575,10 @@ def validate_segment_record(rec: Mapping[str, Any], *, embedded: bool = False) -
                 if v is not None and not (_is_int(v) if integer else _is_num(v)):
                     p.append(f"gate.scores.{name} must be {'an integer' if integer else 'a number'} or null")
         th = g.get("thresholds")
-        if not (isinstance(th, Mapping) and all(isinstance(k, str) and (v is None or _is_num(v)) for k, v in th.items())):
-            p.append("gate.thresholds must map names to numbers or null")
+        if not (isinstance(th, Mapping) and all(
+                isinstance(k, str) and (isinstance(v, str) if k in THRESHOLD_TEXT_FIELDS else (v is None or _is_num(v)))
+                for k, v in th.items())):
+            p.append(f"gate.thresholds must map names to numbers or null ({', '.join(THRESHOLD_TEXT_FIELDS)}: text)")
         _num_ok(p, "gate.audit_draw", g.get("audit_draw"), lo=0.0, hi=1.0, nullable=True)
 
     _keys(p, "survey", rec.get("survey"), SURVEY_FIELDS)

@@ -15,8 +15,9 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+import torch
 
-from .blur import gaussian_blur
+from .blur import device_for, gaussian_blur
 
 
 def normalised_gray(rgb: np.ndarray, illum_sigma: float = 12.0) -> np.ndarray:
@@ -27,19 +28,44 @@ def normalised_gray(rgb: np.ndarray, illum_sigma: float = 12.0) -> np.ndarray:
 
 
 def ridge_strength(gray: np.ndarray, sigmas: tuple[float, ...]) -> np.ndarray:
-    """Dark-line strength: the largest Hessian eigenvalue minus the smaller one's magnitude."""
+    """Dark-line strength: the largest Hessian eigenvalue minus the smaller one's magnitude.
+
+    The derivatives are always OpenCV's (CPU). Where the pipeline's blur runs on the GPU for an image this
+    size (blur.device_for), the eigenvalue arithmetic does too, bit for bit (`_ridge_gpu`): in numpy it
+    was ~215 ms of float32 temporaries per 4 MP gate image, against ~60 ms for the derivatives.
+    """
+    dev = device_for(gray.shape, min(sigmas)) if gray.dtype == np.float32 and sigmas else None
     out = np.zeros_like(gray, dtype=np.float32)
     for s in sigmas:
         g = cv2.GaussianBlur(gray, (0, 0), s)
         dxx = cv2.Sobel(g, cv2.CV_32F, 2, 0, ksize=3)
         dyy = cv2.Sobel(g, cv2.CV_32F, 0, 2, ksize=3)
         dxy = cv2.Sobel(g, cv2.CV_32F, 1, 1, ksize=3)
+        if dev is not None:
+            out = _ridge_gpu(out, dxx, dyy, dxy, s, dev)
+            continue
         tmp = np.sqrt((dxx - dyy) ** 2 + 4 * dxy**2)
         l1 = 0.5 * (dxx + dyy + tmp)     # across a dark line: large and positive
         l2 = 0.5 * (dxx + dyy - tmp)     # along the line: near zero
         line = np.maximum(l1 - np.abs(l2), 0.0) * (s * s)
         np.maximum(out, line, out=out)
     return out
+
+
+@torch.inference_mode()
+def _ridge_gpu(out: np.ndarray, dxx: np.ndarray, dyy: np.ndarray, dxy: np.ndarray, s: float,
+               dev: torch.device) -> np.ndarray:
+    """One scale of ridge_strength on the GPU, in numpy's operation order (each a separate, correctly rounded
+    float32 kernel: x**2 is x*x, 4*x is a float32 product, sqrt is IEEE), so the result is the numpy one."""
+    xx, yy, xy, o = (torch.from_numpy(a).to(dev) for a in (dxx, dyy, dxy, out))
+    d = xx - yy
+    q = xy * xy
+    tmp = torch.sqrt(d * d + q * 4)
+    tr = xx + yy
+    l1 = (tr + tmp) * 0.5
+    l2 = (tr - tmp) * 0.5
+    line = torch.clamp_min(l1 - torch.abs(l2), 0.0) * (s * s)
+    return torch.maximum(o, line).cpu().numpy()
 
 
 @dataclass
@@ -99,6 +125,9 @@ class CrackDetector:
             elong = (np.hypot(w, h) ** 2) / max(area, 1)
             if length_mm >= self.min_length_mm and elong >= self.min_elongation:
                 keep[i] = True
+                # Peak z inside the component's own box (the whole-image comparison per component cost
+                # ~0.3 s per 4 MP gate image on real roads, which have hundreds of components).
+                box = (slice(y, y + h), slice(x, x + w))
                 comps.append(CrackComponent((int(x), int(y), int(x + w), int(y + h)), length_mm,
-                                            float(z[labels == i].max()), int(area)))
+                                            float(z[box][labels[box] == i].max()), int(area)))
         return keep[labels], comps

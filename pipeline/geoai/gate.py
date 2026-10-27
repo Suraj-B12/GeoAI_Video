@@ -39,16 +39,20 @@ import json
 import math
 from fractions import Fraction
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
 from . import __version__
 from .config import Config, GateConfig
-from .dinov2 import PATCH
-from .extract import ExtractionError, View
-from .geometry import CameraModel
 from .util import log, sha256_file, write_json_atomic
+
+# `geoai gate-calibrate` runs on the VLM machine, where only numpy and pandas are installed (as do
+# vlm-import and analyze), so the modules that pull in torch and OpenCV (dinov2, extract, geometry) are
+# imported only by the view and the gate, which run on the pipeline machine.
+if TYPE_CHECKING:
+    from .extract import View
+    from .geometry import CameraModel
 
 # Road beyond the farthest segment far edge a candidate frame can need, kept in the view: the
 # camera position is that of the centre row, and a frame can lie a fraction of a frame of travel
@@ -88,6 +92,10 @@ def plan_segment_view(model: CameraModel, near_m: float, far_needed_m: float, cf
     then whole patches: gw = floor(W ds / 14) columns, gh = ceil(rows x ds / 14) rows, with the
     window extended upwards to exactly gh patch rows (or clipped at the top of the frame).
     """
+    from .dinov2 import PATCH
+    from .extract import ExtractionError, View
+    from .geometry import CameraModel
+
     if not (math.isfinite(near_m) and near_m > 0):
         raise ExtractionError(f"near_m must be a positive distance ahead, got {near_m}")
     if not (math.isfinite(far_needed_m) and far_needed_m > near_m):
@@ -195,6 +203,8 @@ class SegmentGate:
     """
 
     def __init__(self, detector, view: View, cfg: Config | GateConfig):
+        from .dinov2 import PATCH
+
         g = _gate_cfg(cfg)
         if g.mode not in MODES:
             raise ValueError(f"gate.mode must be one of {MODES}, got {g.mode!r}")

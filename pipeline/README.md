@@ -35,15 +35,25 @@ python ../tools/pull_sessions.py D:/geoai/sessions
 ```bash
 python -m geoai process D:/geoai/sessions/<session_id> --out D:/geoai/runs
 ```
+`process` runs **segment mode** by default ([docs/pipeline/13](../docs/pipeline/13-segment-frames.md)): one best full frame per 5 m of road, a distress check (gate), and `send`/`audit` frames written at full resolution as lossless PNG. `--send-all` sends every covered segment (calibration runs); `--mode crops` runs the crop mode described below.
 ```bash
 python -m geoai vlm-export D:/geoai/runs/<session_id> --batch E:/vlm_batch_001
 ```
-Copy `E:/vlm_batch_001` to the VLM machine and, inside it, run `python run_vlm_batch.py .` (standard library only; it calls their existing `POST /classify`). Bring the folder back, then:
+Copy `E:/vlm_batch_001` to the VLM machine and, inside it, run `python run_vlm_batch.py .` (standard library only; it calls their existing `POST /classify`). Then, there or back on the pipeline PC:
 ```bash
-python -m geoai vlm-import E:/vlm_batch_001 D:/geoai/runs/<session_id>
+python -m geoai vlm-import E:/vlm_batch_001 [D:/geoai/runs/<session_id>]
 ```
+```bash
+python -m geoai analyze E:/vlm_batch_001
+```
+```bash
+python -m geoai gate-calibrate E:/vlm_batch_001 --target-recall 0.9
+```
+`vlm-export` and `vlm-import` detect the mode (`report.json`, `batch.json`); for segment batches the run folders are optional. `vlm-import`, `analyze` and `gate-calibrate` need only numpy and pandas (no torch, OpenCV or GPU). `gate-calibrate` writes `gate_calibration.json` into the first batch (or `--out`); set `gate.calibration` to it. Every `process` run also appends a structured log, `<out>/logs/<UTC date>/<session>.jsonl`.
 
-Output of `process`, per session (`runs/<session_id>/`):
+Segment-mode output, per session (`runs/<session_id>/`): `frames/<id>.png`, `sidecars/<id>.json` (schema `geoai.segment.v1`, every status), `segments.csv`, `segments.geojson`, `contact_sheet.jpg`, `report.json` (coverage, gate pass rates, frame quality, timings, VLM-hour estimate).
+
+Crop-mode output, per session (`runs/<session_id>/`):
 
 | File | Content |
 |---|---|
@@ -114,8 +124,8 @@ python -m pytest -m "not slow"
 ```bash
 python -m pytest -m slow
 ```
-- The fast suite has 59 tests and runs in about 2 minutes.
-- The slow suite (9 tests) is end to end on simulated sessions, including a GNSS outage and a run with the probe on, and takes about 5 minutes on a CPU.
+- The fast suite has 205 tests and runs in about 2 minutes (with a GPU).
+- The slow suite (18 tests) is end to end on simulated sessions in both modes, including a GNSS outage, a run with the probe on, and segment mode through export, the real runner against a fake VLM server, import, analysis and calibration. It takes about 5 minutes with a GPU, much longer on a CPU.
 - Set `GEOAI_EMULATOR_SESSION=<folder>` to also run the video-join tests on a real app recording.
 
 The simulator (`python -m geoai simulate OUT`) writes a complete session package (spec v1.1) with known distresses, lane markings, a shadow, 1 Hz GNSS with noise and latency, a rolling shutter and H.264 fragmented MP4. `python -m geoai evaluate RUN truth.json` scores a run against it.
@@ -182,7 +192,10 @@ All parameters with defaults and reasons are in `geoai/config.py`; override them
 | `dinov2.py` | DINOv2 ViT-S/14 (registers), dense tiled patch features |
 | `anomaly.py`, `cracks.py` | Session bank, patch scores, evidence; absolute crack detector |
 | `qwen.py` | Qwen2.5-VL `smart_resize` and crop planning |
-| `extract.py` | Frame selection, detection, geolocation, crops, ground-plane de-duplication, optional budget, outputs |
+| `extract.py` | Crop mode: frame selection, detection, geolocation, crops, ground-plane de-duplication, optional budget, outputs |
+| `frames.py` | Segment mode orchestrator: plan, bank, one decode pass, best frame, gate, records, PNGs, report |
+| `segments.py`, `gate.py`, `segment_records.py`, `analyze.py` | Segment geometry and best-frame choice; distress check and calibration; record schema and files; survey analysis |
+| `runlog.py` | Structured JSON-lines run logs |
 | `blur.py` | Large-sigma Gaussian blur on the GPU (OpenCV's kernel and border; checked against cv2) |
 | `records.py` | PNG with EXIF/XMP-like metadata, sidecars, CSV, GeoJSON |
 | `vlm.py`, `tools/run_vlm_batch.py` | Folder-batch export, VLM-side runner, validated import |

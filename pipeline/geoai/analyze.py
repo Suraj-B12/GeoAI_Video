@@ -648,6 +648,52 @@ def report_md(data: BatchData, summary: pd.DataFrame, km: pd.DataFrame, gate: di
     return "\n".join(L)
 
 
+# ---- gate calibration input ----------------------------------------------------------------------
+
+def calibration_rows(batch_dirs: Sequence[Path], cfg: Config) -> tuple[list[dict], dict]:
+    """The rows `gate.calibrate` needs, from answered segment batches, and where they came from.
+
+    One row per segment the VLM answered with a usable class (distress or normal, `answer_class`):
+    {"scores": the record's gate scores, "vlm_distress": class == "distress"}. Answers without a valid
+    label, unanswered requests and segments without a gate block are left out and counted. A segment
+    in several batches is used once, with the answer of the last batch given (a re-run batch replaces
+    an earlier answer). The source block lists, per batch, the rows used by gate mode and status:
+    rows from gate-mode runs over-represent gate-positive segments (only a random audit share of the
+    negatives is sent), so a calibration should come from send-all runs; `gated_rows` makes a mixed
+    input visible.
+    """
+    allowed = set(cfg.vlm.labels)
+    by_id: dict[str, tuple[str, dict, dict]] = {}
+    per_batch = []
+    for b in batch_dirs:
+        data = load_batch(Path(b), cfg)
+        used = skipped_unknown = 0
+        for row in data.rows:
+            if not row["answered"]:
+                continue
+            rec = data.records[row["id"]]
+            cls, _ = answer_class(data.answers.results[row["id"]], allowed)
+            if cls not in KNOWN or rec.get("gate") is None:
+                skipped_unknown += 1
+                continue
+            by_id[row["id"]] = (data.batch_dir.name, rec, {"scores": dict(rec["gate"]["scores"]),
+                                                            "vlm_distress": cls == "distress"})
+            used += 1
+        per_batch.append({"batch_id": data.batch_dir.name, "requests": len(data.answers.requests),
+                          "answered": len(data.answers.results), "usable": used, "no_valid_label": skipped_unknown})
+    ids = sorted(by_id, key=lambda i: (by_id[i][1]["session_id"], by_id[i][1]["segment"]["k"]))
+    rows = [by_id[i][2] for i in ids]
+    composition: dict[str, int] = defaultdict(int)
+    for i in ids:
+        g = by_id[i][1]["gate"]
+        composition[f"{g['mode']}:{by_id[i][1]['status']}"] += 1
+    gated = sum(v for k, v in composition.items() if k.startswith("gate:"))
+    source = {"batches": per_batch, "rows": len(rows), "duplicates_replaced": sum(p["usable"] for p in per_batch) - len(rows),
+              "by_mode_and_status": dict(sorted(composition.items())), "gated_rows": gated,
+              "sessions": sorted({by_id[i][1]["session_id"] for i in ids})}
+    return rows, source
+
+
 # ---- entry point ---------------------------------------------------------------------------------
 
 def analyze(batch_dir: Path, cfg: Config | None = None) -> dict:

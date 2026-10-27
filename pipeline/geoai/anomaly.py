@@ -40,7 +40,7 @@ import torch
 from scipy import ndimage
 from skimage.filters import apply_hysteresis_threshold
 
-from .blur import gaussian_blur, set_device
+from .blur import blur_tensor, device_for, gaussian_blur, set_device
 from .config import AnomalyConfig, CrackConfig
 from .cracks import CrackDetector
 from .dinov2 import PATCH
@@ -99,6 +99,10 @@ def _kcenter(X: torch.Tensor, m: int, seed: int) -> torch.Tensor:
     (X of a 15k-patch row is 47 MB, read 4096 times). The chosen index stays on the GPU: reading it
     on the host every step stalled the queue between steps. The product is the same call on the same
     tensors as before, so the choice is identical.
+
+    On the GPU the steps are replayed as a CUDA graph of KCENTER_GRAPH_STEPS steps (`_kcenter_steps_graph`):
+    the same kernels on the same tensors, launched without the per-kernel host overhead, which was half of
+    each step (149 us per step for 16k x 768, i.e. 59 of the 79 s that finalising a 97-row bank took).
     """
     n = X.shape[0]
     if n <= m:
@@ -108,10 +112,54 @@ def _kcenter(X: torch.Tensor, m: int, seed: int) -> torch.Tensor:
     idx = torch.empty(m, dtype=torch.long, device=X.device)
     idx[0] = first
     mind = 1.0 - X @ X[first]
+    if X.is_cuda and m - 1 >= 2 * KCENTER_GRAPH_STEPS:
+        return _kcenter_steps_graph(X, idx, mind, m)
     for i in range(1, m):
         j = torch.argmax(mind, 0, keepdim=True)
         idx[i:i + 1] = j
         mind = torch.minimum(mind, 1.0 - X @ X.index_select(0, j)[0])
+    return idx
+
+
+# k-center steps per captured CUDA graph: long enough that launching the graph costs little per step, short
+# enough to capture quickly (the remainder after the last whole graph runs step by step).
+KCENTER_GRAPH_STEPS = 64
+
+
+def _kcenter_steps_graph(X: torch.Tensor, idx: torch.Tensor, mind: torch.Tensor, m: int) -> torch.Tensor:
+    """Steps 1..m-1 of _kcenter, as replays of a captured CUDA graph (results identical to the loop).
+
+    A step is the loop's kernels in its order: argmax of mind, index_select of that row, the matrix-vector
+    product, 1 - it, and the element-wise minimum (written into mind in place, which an element-wise
+    kernel allows). The step number lives on the device (`pos`), so one graph serves every step. One step
+    is first run eagerly on a side stream, as CUDA graph capture requires (it also initialises cuBLAS);
+    then a graph of KCENTER_GRAPH_STEPS steps is captured (capturing runs nothing) and replayed; the steps
+    left over run eagerly. tests/test_gate.py compares the result with the first version of the loop.
+    """
+    pos = torch.ones(1, dtype=torch.long, device=X.device)
+
+    def step():
+        j = torch.argmax(mind, 0, keepdim=True)
+        idx.index_copy_(0, pos, j)
+        pos.add_(1)
+        torch.minimum(mind, 1.0 - X @ X.index_select(0, j)[0], out=mind)
+
+    side = torch.cuda.Stream(device=X.device)
+    side.wait_stream(torch.cuda.current_stream(X.device))
+    with torch.cuda.stream(side):
+        step()
+    torch.cuda.current_stream(X.device).wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(KCENTER_GRAPH_STEPS):
+            step()
+    remaining = m - 2
+    for _ in range(remaining // KCENTER_GRAPH_STEPS):
+        graph.replay()
+    for _ in range(remaining % KCENTER_GRAPH_STEPS):
+        step()
+    torch.cuda.current_stream(X.device).synchronize()
+    del graph
     return idx
 
 
@@ -318,9 +366,17 @@ def _merge_boxes(cands: list[Candidate], gap: int) -> list[Candidate]:
 
 
 def normalise_illumination(rgb: np.ndarray, sigma: float | None) -> np.ndarray:
-    """Divide by the local mean brightness (keeps colour ratios); removes most of a shadow."""
+    """Divide by the local mean brightness (keeps colour ratios); removes most of a shadow.
+
+    Where the blur runs on the GPU (blur.device_for), so does the rest, with the same result bit for bit
+    (`_normalise_illumination_gpu`): the numpy version spent ~200 ms per 4 MP gate image on float32
+    temporaries, a median and a mean over three channels, around an 8 ms blur.
+    """
     if not sigma:
         return rgb
+    dev = device_for(rgb.shape[:2], sigma)
+    if dev is not None:
+        return _normalise_illumination_gpu(rgb, sigma, dev)
     f = rgb.astype(np.float32)
     lum = f.mean(-1)
     local = gaussian_blur(lum, sigma)
@@ -328,21 +384,63 @@ def normalise_illumination(rgb: np.ndarray, sigma: float | None) -> np.ndarray:
     return np.clip(f * (target / np.maximum(local, 1.0))[..., None], 0, 255).astype(np.uint8)
 
 
+@torch.inference_mode()
+def _normalise_illumination_gpu(rgb: np.ndarray, sigma: float, dev: torch.device) -> np.ndarray:
+    """normalise_illumination's numpy arithmetic on the GPU, operation for operation, so the result is identical.
+
+    The channel sum of uint8 values is an integer below 2^24, exact in float32 in any order. numpy's mean
+    then divides it by the count, an int64 scalar, which promotes the division to float64; the quotient is
+    rounded to float32 only when stored, so it is computed the same way here. The median is numpy's: the middle value,
+    or for an even count the float32 mean of the two middle values. The scale is float32(target) /
+    max(local, 1) (numpy 2 casts the Python float to the array's float32), times the channel value, clipped
+    to [0, 255] and truncated to uint8. IEEE float32 +, -, *, / are correctly rounded on both devices and
+    each is its own kernel here (nothing is fused), so every value is the numpy value
+    (tests/test_gpu_filters.py compares them).
+    """
+    x = torch.from_numpy(np.ascontiguousarray(rgb)).to(dev).float()
+    lum = _channel_mean_gpu(x)
+    flat = torch.sort(lum.reshape(-1)).values
+    n = flat.numel()
+    med = flat[n // 2] if n % 2 else (flat[n // 2 - 1] + flat[n // 2]) / 2
+    scale = med / torch.clamp_min(blur_tensor(lum, sigma), 1.0)
+    return torch.clamp(x * scale[..., None], 0, 255).to(torch.uint8).cpu().numpy()
+
+
 def paint_fraction(rgb: np.ndarray, grid_h: int, grid_w: int, ratio: float, sigma: float = 40.0) -> np.ndarray:
     """Share of each patch covered by road paint: much brighter than the local road surface.
 
     Local road brightness is a median-like estimate (blur of a brightness image with paint
-    clipped), so a marking doesn't raise its own reference.
+    clipped), so a marking doesn't raise its own reference. Where the blur runs on the GPU, the paint mask
+    is computed there, bit for bit as in numpy (`_paint_mask_gpu`); dilation and the patch means stay here.
     """
-    lum = rgb.astype(np.float32).mean(-1)
-    ref0 = gaussian_blur(lum, sigma)
-    clipped = np.minimum(lum, ref0 * 1.15)
-    ref = gaussian_blur(clipped, sigma)
-    paint = (lum > ratio * ref).astype(np.uint8)
+    dev = device_for(rgb.shape[:2], sigma)
+    if dev is not None:
+        paint = _paint_mask_gpu(rgb, ratio, sigma, dev)
+    else:
+        lum = rgb.astype(np.float32).mean(-1)
+        ref0 = gaussian_blur(lum, sigma)
+        clipped = np.minimum(lum, ref0 * 1.15)
+        ref = gaussian_blur(clipped, sigma)
+        paint = (lum > ratio * ref).astype(np.uint8)
     # Grow by half a patch: patches that only touch a marking's edge see it too.
     paint = cv2.dilate(paint, np.ones((PATCH, PATCH), np.uint8)).astype(np.float32)
     h, w = grid_h * PATCH, grid_w * PATCH
     return paint[:h, :w].reshape(grid_h, PATCH, grid_w, PATCH).mean(axis=(1, 3))
+
+
+def _channel_mean_gpu(x: torch.Tensor) -> torch.Tensor:
+    """numpy's float32 mean over the last axis (3 channels) of uint8 values, exactly: the integer sum, then a
+    float64 division by the count (numpy divides by an int64 scalar), rounded to float32 when stored."""
+    return ((x[..., 0] + x[..., 1] + x[..., 2]).double() / 3).float()
+
+
+@torch.inference_mode()
+def _paint_mask_gpu(rgb: np.ndarray, ratio: float, sigma: float, dev: torch.device) -> np.ndarray:
+    """paint_fraction's mask (uint8 0/1) on the GPU with numpy's float32 operations (the Python floats 1.15
+    and ratio are rounded to float32 first, as numpy 2 does), so it is identical to the numpy mask."""
+    lum = _channel_mean_gpu(torch.from_numpy(np.ascontiguousarray(rgb)).to(dev).float())
+    clipped = torch.minimum(lum, blur_tensor(lum, sigma) * 1.15)
+    return (lum > blur_tensor(clipped, sigma) * ratio).to(torch.uint8).cpu().numpy()
 
 
 class AnomalyDetector:
