@@ -24,6 +24,7 @@ deterministic. Structured logs (runlog.py) go to <out_root>/logs/, outside the r
 """
 from __future__ import annotations
 
+import json
 import math
 import shutil
 import time
@@ -57,6 +58,32 @@ from .vlm import SECONDS_PER_IMAGE
 # would put many copies of one place into the bank.
 BANK_MIN_SPEED_MPS = 1.0
 _PCTS = (10, 50, 90)
+# Progress log lines at most this often. The VLM system's video toggle tails this log to show the
+# extraction live; a 2.6 km session runs ~10 min, so 2 s is smooth without flooding the log.
+PROGRESS_EVERY_S = 2.0
+
+
+class _Progress:
+    """Throttled `progress {json}` log lines for a watcher that tails the log.
+
+    One line per phase change and at most one per `every_s` within a phase; `force` writes one
+    regardless (a phase's last count). Lines go to the log only, never into the run folder, so the
+    outputs stay byte-identical across reruns. Fields: phase ("plan" | "bank" | "bank_finalize" |
+    "decode" | "outputs"), done, total (an estimate for the bank), and phase-specific counts.
+    """
+
+    def __init__(self, every_s: float = PROGRESS_EVERY_S):
+        self.every_s = float(every_s)
+        self._phase: str | None = None
+        self._last = -math.inf
+
+    def update(self, phase: str, done: int, total: int | None, *, force: bool = False, **fields) -> None:
+        now = time.monotonic()
+        if not force and phase == self._phase and now - self._last < self.every_s:
+            return
+        self._phase, self._last = phase, now
+        log.info("progress %s", json.dumps({"phase": phase, "done": int(done), "total": total, **fields},
+                                           sort_keys=True, default=str))
 
 
 class _TimedFeatures:
@@ -217,6 +244,8 @@ def _process(session_dir: Path, out_root: Path, cfg: Config, allow_test: bool, a
                  len(segments), cfg.segments.length_m, segments[0].s0, offset, cfg.segments.window_m)
         st.update(segments=len(segments), near_m=sel.near_m, far_m=sel.far_m, offset_m=offset,
                   sizes=[f"{w}x{h}" for w, h in rs])
+    prog = _Progress()
+    prog.update("plan", 0, len(segments), route_m=round(route, 1), length_m=cfg.segments.length_m)
 
     if features is None:
         features = PatchFeatures(Path(cfg.anomaly.weights), cfg.anomaly.device, cfg.anomaly.tile_patches,
@@ -231,13 +260,13 @@ def _process(session_dir: Path, out_root: Path, cfg: Config, allow_test: bool, a
 
     # ---- 3. bank ----
     with rl.stage("bank") as st:
-        bank = _bank_pass(s, traj, cfg, rs, seg_files, seg_res, rotate180, black, timed, route)
+        bank = _bank_pass(s, traj, cfg, rs, seg_files, seg_res, rotate180, black, timed, route, prog)
         timings.update({f"bank_{k}": v for k, v in bank.items()})
         st.update(frames={f"{w}x{h}": r.bank_frames for (w, h), r in rs.items()}, **bank)
 
     # ---- 4. decode, select, gate, records ----
     with rl.stage("decode") as st:
-        dec = _Decode(s, traj, cfg, rs, sel, out, chainage_origin)
+        dec = _Decode(s, traj, cfg, rs, sel, out, chainage_origin, prog)
         t_dec = time.time()
         dino_before = timed.seconds
         for seg, path in seg_files.items():
@@ -254,6 +283,7 @@ def _process(session_dir: Path, out_root: Path, cfg: Config, allow_test: bool, a
              len(recs), timings["decode_pass"], dec.t_gate)
 
     # ---- 5. outputs ----
+    prog.update("outputs", len(recs), len(segments), force=True)
     with rl.stage("outputs") as st:
         t_out = time.time()
         write_segment_outputs(out, recs)
@@ -279,7 +309,8 @@ def _fmt_pct(x: float | None) -> str:
 # ---- bank pass -------------------------------------------------------------------------------
 
 def _bank_pass(s: Session, traj: Trajectory, cfg: Config, rs: dict[tuple[int, int], _Res], seg_files: dict,
-               seg_res: dict, rotate180: bool, black: list, features: _TimedFeatures, route: float) -> dict:
+               seg_res: dict, rotate180: bool, black: list, features: _TimedFeatures, route: float,
+               prog: _Progress) -> dict:
     """Build every gate's bank: frames spread along the route, as extract.process_session's pass 1.
 
     A frame qualifies when the trajectory is valid there, it is not reversing, not in a black interval,
@@ -319,6 +350,9 @@ def _bank_pass(s: Session, traj: Trajectory, cfg: Config, rs: dict[tuple[int, in
     def run(keyframes_only: bool, spacing: float, only: set | None) -> None:
         nonlocal t_feat
         next_s = {res: -math.inf for res in rs}
+        # Expected bank size (progress only): one frame per `spacing` of road, capped, per recording size.
+        target = sum(min(an.bank_max_frames, max(1, math.ceil(route / spacing)))
+                     for res in rs if only is None or res in only)
         for seg, path in seg_files.items():
             res = seg_res[seg]
             if only is not None and res not in only:
@@ -345,6 +379,7 @@ def _bank_pass(s: Session, traj: Trajectory, cfg: Config, rs: dict[tuple[int, in
                 r.gate.add_bank_frame(fr.rgb, chosen.pop(fr.index))
                 t_feat += time.perf_counter() - t
                 r.bank_frames += 1
+                prog.update("bank", sum(x.bank_frames for x in rs.values()), target)
 
     run(True, max(an.bank_spacing_m, route / max(an.bank_max_frames, 1)), None)
     short = {res for res, r in rs.items() if r.bank_frames < an.bank_min_frames}
@@ -355,6 +390,8 @@ def _bank_pass(s: Session, traj: Trajectory, cfg: Config, rs: dict[tuple[int, in
             rs[res].bank_frames = 0
         run(False, max(0.5, route / (2 * an.bank_min_frames)), short)
     t_fin = time.time()
+    n_bank = sum(r.bank_frames for r in rs.values())
+    prog.update("bank_finalize", n_bank, n_bank, force=True)
     for res, r in rs.items():
         if r.bank_frames < 2:
             raise ExtractionError(f"only {r.bank_frames} usable bank frames at {res[0]}x{res[1]}")
@@ -372,8 +409,10 @@ class _Decode:
     """The one decode pass: frames -> selector -> finished segments -> gate -> records and PNGs."""
 
     def __init__(self, s: Session, traj: Trajectory, cfg: Config, rs: dict[tuple[int, int], _Res],
-                 sel: BestFrameSelector, out: Path, chainage_origin: float):
+                 sel: BestFrameSelector, out: Path, chainage_origin: float, prog: _Progress):
         self.s, self.traj, self.cfg, self.rs, self.sel, self.out = s, traj, cfg, rs, sel, out
+        self.prog = prog
+        self.status_counts = {k: 0 for k in STATUSES}
         self.chainage_origin = chainage_origin
         self.main = rs[max(rs, key=lambda res: res[0] * res[1])]  # the largest size: its geometry for uncovered segments
         self.config_sha = config_digest(cfg)
@@ -474,6 +513,10 @@ class _Decode:
                 r0, r1 = res.best.row_slice
                 self.pool.submit(self.out / "segment_views" / f"{rid}.png", res.rgb[r0:r1], rec, **kw)
         self.records.append(rec)
+        self.status_counts[rec["status"]] += 1
+        # Progress: the frame named here is written by the PNG pool shortly after (sent segments only).
+        self.prog.update("decode", len(self.records), len(self.sel.segments), segment=rid, k=seg.k,
+                         status=rec["status"], frames_decoded=self.n_decoded, **self.status_counts)
         # The result without its frame: report statistics only, the RGB is released here.
         self.results.append(SegmentResult(res.segment, res.window, res.best, None, res.n_candidates,
                                           res.sharpness_rank, res.reason, res.excluded))
