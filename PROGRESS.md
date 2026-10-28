@@ -2,6 +2,22 @@
 
 Updated as work lands. If a session ends mid-task, a new session can continue from here.
 
+## State on 28 Oct 2026, evening (stopped by the usage limit)
+
+- Done and pushed: batch_001 classified (813/813) and stored; research record `docs/research/METRICS.md`;
+  review fixes `ce82205` (runner `--profile video` 14.4 → 5.2 s/image; calibrated gate files; gate threads;
+  opt-in `segments.choice=nearest_sharp` and `vlm.image=band`, both off by default).
+- Measured, not yet written up: band crop is **not** better than the whole frame (84 % agreement, flips split
+  21 band / 17 frame / 14 unclear) → keep `image=frame`. Probe-only gate held out by session: recall 87.8 %
+  at 59.4 % pass (below the 0.90 target) → keep the defaults. Luma sharpness: same frame on 811/813
+  segments, ~2.9× faster per call.
+- Not done: nearest_sharp analysis (re-extraction is in `field/runs_eval/nearest`); extraction timing on GPU
+  (script stuck on a stale `C:\GeoAI\gpu.lock`); METRICS.md §9.
+- GPU suite: 1 failure, `test_probe.py::test_flags_held_out_distress_frames_more_than_clean_ones` (sample folder
+  `08_no_distress_annotated` missing on the VLM PC; fixture gap).
+- Full notes, numbers and resume steps: Capstone repo `eval_results/video_fixes/STATUS.md`
+  (study files in `C:\GeoAI\analysis\` on the VLM PC).
+
 ## State on 27 Oct 2026, evening (HANDOFF_PLAN steps 1–6 built on the VLM PC)
 
 | Part | Status |
