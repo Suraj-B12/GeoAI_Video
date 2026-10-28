@@ -5,19 +5,28 @@ Standard library only (Python 3.8+). Usage, from inside the batch folder:
 
     python run_vlm_batch.py .
     python run_vlm_batch.py . --url http://127.0.0.1:8000 --api-key KEY
+    python run_vlm_batch.py . --profile video        # drive-video frames (see --profile)
 
 For every image in requests.jsonl it POSTs the file to /classify (multipart field "file") and
 appends one JSON line to responses.jsonl:
     {"request_id", "kind", "http_status", "seconds", "started_utc", "attempts", "response": <server JSON>, "error"}
 
-- It verifies SHA256SUMS first and stops if any file differs.
+- It verifies SHA256SUMS first and stops if any file differs. --skip-batch-check skips that full re-hash:
+  safe only when an earlier call already verified the same batch on the same disk (the toggle verifies
+  on its first chunk of a session and skips on the later ones). Every image is still hashed while it is
+  uploaded and checked against requests.jsonl, so a changed image is never recorded as answered.
+- --profile NAME adds the form field "profile" to every request. The server then also returns
+  "profile" and "views_recorded". "video" makes the classifier skip the probe's record-only tile views
+  (about 9 s of a 13 s Normal answer); its labels, confidences and review flag are unchanged. Without
+  --profile the request is exactly as before.
 - It records GET /health in vlm_run.json (one entry per run) and warns when /health does not mention
   the model or prompt version the batch expects.
 - Uploads are streamed from disk. Each image is read once, hashed while it is sent, and never held in
   memory whole (a full 4K frame is several MB). The hash is checked against requests.jsonl after the
   upload, so an image that changed on disk is never recorded as answered.
-- It sends one request at a time, starting them at least --min-interval apart (6.5 s keeps within the
-  server's 10 per minute).
+- It sends one request at a time, starting them at least --min-interval apart. The default is 6.5 s, which
+  keeps within the server's 10 per minute, except when --url is this machine (127.0.0.1, ::1,
+  localhost): the server does not rate-limit unproxied loopback requests, so the default there is 0.
 - Retries:
   - HTTP 429 waits for Retry-After (or backs off);
   - HTTP 5xx, timeouts and connection errors are retried with exponential backoff (--retries,
@@ -38,17 +47,20 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import platform
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
 
-RUNNER_VERSION = "2"
+RUNNER_VERSION = "3"
+REMOTE_MIN_INTERVAL_S = 6.5   # 60 s / 10 requests per minute (the server's limit for remote clients)
 CHUNK = 1 << 20
 MAX_WAIT_S = 300.0       # longest single backoff or Retry-After wait
 
@@ -81,6 +93,17 @@ def check_sums(d: Path) -> list:
     return [rel for digest, rel in entries if not (d / rel).exists() or sha256(d / rel) != digest]
 
 
+def is_loopback_url(url: str) -> bool:
+    """True when the URL's host is this machine (127.0.0.0/8, ::1 or 'localhost')."""
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def get_json(url: str, headers: dict, timeout: float):
     """(status, parsed JSON or None) of a GET."""
     req = urllib.request.Request(url, headers=headers, method="GET")
@@ -99,7 +122,7 @@ def _parse_json(raw: bytes):
 
 
 class MultipartFile:
-    """A multipart/form-data body with one file field, produced in chunks.
+    """A multipart/form-data body with one file field (after optional text fields), produced in chunks.
 
     http.client sends any body that has read() block by block, so the image is streamed from disk
     instead of being joined into one bytes object (the old runner held each image twice in memory).
@@ -107,10 +130,12 @@ class MultipartFile:
     exactly the expected file was sent.
     """
 
-    def __init__(self, path: Path, field: str = "file", content_type: str = "image/png"):
+    def __init__(self, path: Path, field: str = "file", content_type: str = "image/png", fields: dict | None = None):
         boundary = "geoai" + uuid.uuid4().hex
         self.content_type = "multipart/form-data; boundary=" + boundary
-        self._head = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; "
+        text = "".join(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+                       for k, v in (fields or {}).items())
+        self._head = (text + f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; "
                       f"filename=\"{path.name}\"\r\nContent-Type: {content_type}\r\n\r\n").encode("utf-8")
         self._tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
         self._size = path.stat().st_size
@@ -153,12 +178,12 @@ class MultipartFile:
         self._f.close()
 
 
-def post_file(url: str, path: Path, headers: dict, timeout: float):
+def post_file(url: str, path: Path, headers: dict, timeout: float, fields: dict | None = None):
     """POST one image; returns (status, parsed JSON or None, raw text excerpt, response headers, body).
 
     Connection errors and timeouts are raised (OSError, http.client.HTTPException) for the caller to retry.
     """
-    body = MultipartFile(path)
+    body = MultipartFile(path, fields=fields)
     try:
         req = urllib.request.Request(url, data=body, method="POST", headers={
             **headers, "Content-Type": body.content_type, "Content-Length": str(body.length)})
@@ -216,7 +241,11 @@ def send_one(d: Path, req: dict, url: str, headers: dict, a, pacer: Pacer) -> di
         line["started_utc"] = utc_now()
         t0 = time.monotonic()
         try:
-            status, resp, text, resp_headers, body = post_file(url, img, headers, a.timeout)
+            if a.profile:
+                status, resp, text, resp_headers, body = post_file(url, img, headers, a.timeout,
+                                                                   fields={"profile": a.profile})
+            else:
+                status, resp, text, resp_headers, body = post_file(url, img, headers, a.timeout)
         except (OSError, http.client.HTTPException) as e:  # URLError, timeouts, resets are all OSError
             line.update(seconds=round(time.monotonic() - t0, 3), http_status=None, response=None,
                         error=f"{type(e).__name__}: {e}")
@@ -305,15 +334,26 @@ def main(argv=None) -> int:
     ap.add_argument("--url", default="http://127.0.0.1:8000")
     ap.add_argument("--api-key", default=None)
     ap.add_argument("--timeout", type=float, default=300.0, help="seconds to wait on the server per request")
-    ap.add_argument("--min-interval", type=float, default=6.5, help="seconds between request starts (10/min limit)")
+    ap.add_argument("--min-interval", type=float, default=None,
+                    help=f"seconds between request starts (default {REMOTE_MIN_INTERVAL_S}, the 10/min limit; "
+                         "0 when --url is this machine, which the server does not rate-limit)")
+    ap.add_argument("--profile", default=None,
+                    help="send this classifier profile with every request ('video' for drive-video frames: "
+                         "skips the server's record-only probe tiles, same labels); default: none, as before")
+    ap.add_argument("--skip-batch-check", action="store_true",
+                    help="do not re-hash the whole batch against SHA256SUMS. Safe only when an earlier call "
+                         "verified this batch on this disk; each image is still hashed as it is uploaded")
     ap.add_argument("--limit", type=int, default=0, help="stop after this many new requests (0 = all)")
-    ap.add_argument("--only-kind", choices=("segment", "crop", "frame"), default=None,
+    ap.add_argument("--only-kind", choices=("segment", "segment_band", "crop", "frame"), default=None,
                     help="send only requests of this kind")
     ap.add_argument("--retries", type=int, default=4, help="retries per image after timeouts, 429 and 5xx")
     ap.add_argument("--retry-wait", type=float, default=5.0, help="first backoff in seconds (doubles per retry)")
     ap.add_argument("--max-failures", type=int, default=5, help="stop after this many failed images in a row")
     ap.add_argument("--max-upload-mb", type=float, default=10.0, help="the server's upload limit (MB)")
     a = ap.parse_args(argv)
+    if a.min_interval is None:
+        a.min_interval = 0.0 if is_loopback_url(a.url) else REMOTE_MIN_INTERVAL_S
+    a.profile = (a.profile or "").strip() or None
     d = a.batch_dir.resolve()
     try:
         return run(d, a)
@@ -323,7 +363,11 @@ def main(argv=None) -> int:
 
 
 def run(d: Path, a) -> int:
-    bad = check_sums(d)
+    if a.skip_batch_check:
+        print("not re-checking SHA256SUMS (--skip-batch-check); each image is hashed as it is sent", flush=True)
+        bad = []
+    else:
+        bad = check_sums(d)
     if bad:
         print(f"STOP: {len(bad)} files differ from SHA256SUMS (copy the batch again): {bad[:5]}", file=sys.stderr)
         return 2
@@ -354,7 +398,8 @@ def run(d: Path, a) -> int:
     run_path = d / "vlm_run.json"
     log = json.loads(run_path.read_text(encoding="utf-8")) if run_path.exists() else {"runs": []}
     this = {"started_utc": utc_now(), "url": a.url, "health": health, "runner_version": RUNNER_VERSION,
-            "host": platform.node(), "python": platform.python_version()}
+            "host": platform.node(), "python": platform.python_version(), "profile": a.profile,
+            "min_interval_s": a.min_interval, "batch_check": "skipped" if a.skip_batch_check else "verified"}
     resp_path = d / "responses.jsonl"
     fixed = repair_tail(resp_path)
     if fixed:
@@ -373,7 +418,7 @@ def run(d: Path, a) -> int:
         todo = todo[:a.limit]
     print(f"{len(reqs)} requests, {len(done & {r['request_id'] for r in reqs})} already answered, "
           f"{len(todo)} to send now (about {fmt_h(len(todo) * 14)} at ~14 s each)", flush=True)
-    sent = ok = failed_in_row = 0
+    sent = ok = failed_in_row = not_confirmed = 0
     pacer = Pacer(a.min_interval)
     t_start = time.monotonic()
     code = None
@@ -386,6 +431,12 @@ def run(d: Path, a) -> int:
                 os.fsync(out.fileno())
                 sent += 1
                 ok += line["error"] is None
+                if a.profile and line["error"] is None and line["response"].get("profile") != a.profile:
+                    # An older server ignores the field and runs its default: valid answers, no speed-up.
+                    not_confirmed += 1
+                    if not_confirmed == 1:
+                        print(f"WARNING: the server did not confirm profile {a.profile!r}; it ran its default",
+                              file=sys.stderr, flush=True)
                 failed_in_row = 0 if line["error"] is None else failed_in_row + 1
                 per = (time.monotonic() - t_start) / sent
                 state = "ok" if line["error"] is None else line["error"]
@@ -404,6 +455,8 @@ def run(d: Path, a) -> int:
         code = 130
     this["finished_utc"] = utc_now()
     this["sent"], this["ok"] = sent, ok
+    if a.profile:
+        this["profile_not_confirmed"] = not_confirmed
     write_json(run_path, log)
     remaining = len([r for r in reqs if r["request_id"] not in answered(resp_path)])
     print(f"done: {ok} answered in this run, {remaining} still to do" + (" (run again to retry)" if remaining else ""))

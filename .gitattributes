@@ -5,6 +5,7 @@
 vlm_handoff/prompts/** -text
 pipeline/models/** -text
 pipeline/tests/data/** -text
+pipeline/calibration/** -text
 *.npz binary
 *.pth binary
 *.jar binary

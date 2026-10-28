@@ -64,6 +64,10 @@ CAPTURE_FIELDS = ("exposure_ns", "iso", "frame_duration_ns", "rs_skew_ns", "focu
                   "ois_mode", "low_light")
 QUALITY_FIELDS = ("sharpness", "sharpness_rank", "n_candidates", "blur_motion_px", "blur_rotation_px", "blur_px",
                   "gyro_rad_s", "reason")
+# Optional, written only when segments.choice is not the default `sharpest` (segments.SegmentResult.quality):
+# the choice, and the chosen frame's FairSharpness, absolute and relative to the best of its tier.
+QUALITY_OPTIONAL = ("choice", "fair_sharpness", "fair_sharpness_rel")
+QUALITY_CHOICES = ("nearest_sharp",)   # segments.CHOICES without the default
 GATE_FIELDS = ("mode", "decision", "decision_if_gated", "reasons", "scores", "thresholds", "audit_draw")
 GATE_SCORE_FIELDS = ("probe_frac", "probe_max_logit", "evidence", "crack_mm", "z_max", "anomalous_patch_frac",
                      "n_patches")
@@ -77,6 +81,16 @@ THRESHOLD_TEXT_FIELDS = ("source", "calibration_file", "calibration_sha256")
 # and the review flag that /classify also returns, and the batch the answer came from.
 VLM_FIELDS = ("labels", "stage1_label", "stage1_confidence", "severity", "description", "valid", "problem",
               "stage2_confidence", "needs_expert_review", "batch_id")
+# Optional in `vlm`: what the VLM was shown ("band" when the batch sent a band; absent = the whole frame).
+VLM_OPTIONAL = ("image",)
+# Optional top-level block of a batch record whose request was a band (vlm.image = band, docs/pipeline/13 §6):
+# the box cut from the frame (pixels, x1 and y1 exclusive), the band's size and its file in the batch, what the
+# VLM's processor makes of it (model_input [w, h], visual tokens), the segment's rows in band coordinates, and
+# how the band was sized: the margin above the far edge (fraction and rows) and the rows added below and above
+# to reach the aspect limit. sha256 is the band PNG's (null in the copy embedded in that PNG).
+VLM_INPUT_FIELDS = ("kind", "file", "sha256", "box", "width", "height", "model_input", "tokens", "rows_of_segment",
+                    "margin_frac", "margin_rows", "extra_rows_below", "extra_rows_above", "max_aspect")
+VLM_INPUT_KINDS = ("band",)
 # Flags, in the order they are listed in a record:
 #   partial             the shorter last segment of a recording (its real length is used everywhere)
 #   low_light           taken under the app's low-light exposure
@@ -303,8 +317,9 @@ def build_segment_record(*, session_id: str, session_meta: Mapping[str, Any], se
     covered = shot is not None
     if not (covered == (camera is not None) == (gate is not None)):
         raise ValueError("a covered segment needs shot, camera and gate; a not-covered one none of them")
-    if set(quality) != set(QUALITY_FIELDS):
-        raise ValueError(f"quality must have exactly the fields {QUALITY_FIELDS}, got {sorted(quality)}")
+    if not set(QUALITY_FIELDS) <= set(quality) <= set(QUALITY_FIELDS + QUALITY_OPTIONAL):
+        raise ValueError(f"quality must have the fields {QUALITY_FIELDS} (optional: {QUALITY_OPTIONAL}), "
+                         f"got {sorted(quality)}")
     rid = segment_id(session_id, segment.k)
     s0, s1 = float(segment.s0), float(segment.s1)
     status = str(gate["decision"]) if covered else "not_covered"
@@ -368,7 +383,7 @@ def build_segment_record(*, session_id: str, session_meta: Mapping[str, Any], se
             flags.add("heading_from_gyro")
         if utc is None:
             flags.add("no_utc")
-    quality_block = {f: _plain(quality[f]) for f in QUALITY_FIELDS}
+    quality_block = {f: _plain(quality[f]) for f in QUALITY_FIELDS + QUALITY_OPTIONAL if f in quality}
     if covered and "over_blur_limit" in str(quality_block["reason"]):
         flags.add("over_blur_limit")
 
@@ -446,7 +461,7 @@ def validate_segment_record(rec: Mapping[str, Any], *, embedded: bool = False) -
     p: list[str] = []
     if not isinstance(rec, Mapping):
         return ["record is not an object"]
-    _keys(p, "record", rec, TOP_FIELDS, optional=("vlm",))
+    _keys(p, "record", rec, TOP_FIELDS, optional=("vlm", "vlm_input"))
     try:
         to_json(rec, indent=None)
     except (TypeError, ValueError) as e:
@@ -571,7 +586,19 @@ def validate_segment_record(rec: Mapping[str, Any], *, embedded: bool = False) -
             p.append("capture.low_light must be true or false")
 
     q = rec.get("quality")
-    if _keys(p, "quality", q, QUALITY_FIELDS):
+    if _keys(p, "quality", q, QUALITY_FIELDS, optional=QUALITY_OPTIONAL):
+        if "choice" in q:
+            if q["choice"] not in QUALITY_CHOICES:
+                p.append(f"quality.choice must be one of {QUALITY_CHOICES} when given, got {q['choice']!r}")
+            for name in ("fair_sharpness", "fair_sharpness_rel"):
+                if name not in q:
+                    p.append(f"quality.{name} must be given with quality.choice")
+                elif covered:
+                    _num_ok(p, f"quality.{name}", q[name], lo=0.0)
+                elif q[name] is not None:
+                    p.append(f"quality.{name} must be null for a not_covered segment")
+        elif any(name in q for name in QUALITY_OPTIONAL):
+            p.append("quality.fair_sharpness and fair_sharpness_rel come only with quality.choice")
         if not isinstance(q.get("reason"), str) or not q.get("reason"):
             p.append("quality.reason must be a non-empty string")
         n = q.get("n_candidates")
@@ -635,13 +662,61 @@ def validate_segment_record(rec: Mapping[str, Any], *, embedded: bool = False) -
         if covered and isinstance(cap, Mapping) and ("low_light" in flags) != (cap.get("low_light") is True):
             p.append("flag `low_light` disagrees with capture.low_light")
 
-    if "vlm" in rec and _keys(p, "vlm", rec["vlm"], VLM_FIELDS):
+    if "vlm" in rec and _keys(p, "vlm", rec["vlm"], VLM_FIELDS, optional=VLM_OPTIONAL):
         v = rec["vlm"]
         if not (isinstance(v.get("labels"), list) and all(isinstance(x, str) for x in v["labels"])):
             p.append("vlm.labels must be a list of strings")
         if not isinstance(v.get("valid"), bool) or not isinstance(v.get("problem"), str):
             p.append("vlm.valid must be true or false and vlm.problem a string")
+        if "image" in v and v["image"] not in VLM_INPUT_KINDS:
+            p.append(f"vlm.image must be one of {VLM_INPUT_KINDS} when given")
+    if "vlm_input" in rec:
+        _vlm_input_ok(p, rec, embedded)
     return p
+
+
+def _vlm_input_ok(p: list[str], rec: Mapping[str, Any], embedded: bool) -> None:
+    """Checks of the optional `vlm_input` block (a band request): consistent with the frame and the processor."""
+    from .qwen import FACTOR, smart_resize  # standard library only
+
+    b, frame = rec["vlm_input"], rec.get("frame")
+    if not _keys(p, "vlm_input", b, VLM_INPUT_FIELDS):
+        return
+    if rec.get("status") not in SENT_STATUSES or not isinstance(frame, Mapping):
+        p.append("vlm_input is only for sent segments")
+        return
+    if b.get("kind") not in VLM_INPUT_KINDS:
+        p.append(f"vlm_input.kind must be one of {VLM_INPUT_KINDS}")
+    if not (isinstance(b.get("file"), str) and b["file"]):
+        p.append("vlm_input.file must be a path")
+    sha = b.get("sha256")
+    if (sha is None and not embedded) or (sha is not None and not (isinstance(sha, str) and _HEX64.match(sha))):
+        p.append("vlm_input.sha256 must be 64 lowercase hex characters")
+    box, w, h = b.get("box"), b.get("width"), b.get("height")
+    fw, fh = frame.get("width"), frame.get("height")
+    if not (isinstance(box, list) and len(box) == 4 and all(_is_int(x) for x in box) and _is_int(fw) and _is_int(fh)
+            and box[0] == 0 and box[2] == fw and 0 <= box[1] < box[3] <= fh):
+        p.append("vlm_input.box must be [0, y0, frame width, y1] inside the frame (a full-width band)")
+        return
+    if (w, h) != (box[2] - box[0], box[3] - box[1]):
+        p.append("vlm_input width and height must be the box's")
+        return
+    mi = b.get("model_input")
+    if not (isinstance(mi, list) and len(mi) == 2 and all(_is_int(x) for x in mi)
+            and tuple(mi) == tuple(reversed(smart_resize(h, w)))):
+        p.append("vlm_input.model_input must be the processor's [width, height] for the band (qwen.smart_resize)")
+    elif b.get("tokens") != (mi[0] // FACTOR) * (mi[1] // FACTOR):
+        p.append("vlm_input.tokens must be model_input's 28 x 28 blocks")
+    rows, fr_rows = b.get("rows_of_segment"), frame.get("rows_of_segment")
+    if not (isinstance(rows, list) and len(rows) == 2 and isinstance(fr_rows, list) and len(fr_rows) == 2
+            and all(_is_num(x) for x in rows + fr_rows)
+            and all(abs(rows[i] - (fr_rows[i] - box[1])) <= 1e-6 for i in (0, 1))):
+        p.append("vlm_input.rows_of_segment must be frame.rows_of_segment minus the band's top row")
+    _num_ok(p, "vlm_input.margin_frac", b.get("margin_frac"), lo=0.0)
+    _num_ok(p, "vlm_input.max_aspect", b.get("max_aspect"), lo=1.0)
+    for name in ("margin_rows", "extra_rows_below", "extra_rows_above"):
+        if not _is_int(b.get(name)) or b[name] < 0:
+            p.append(f"vlm_input.{name} must be an integer >= 0")
 
 
 def _keys(p: list[str], name: str, obj, fields: Sequence[str], optional: Sequence[str] = ()) -> bool:
@@ -703,6 +778,8 @@ def _comparable(rec: Mapping[str, Any]) -> dict:
     r.pop("vlm", None)  # added to the sidecar by vlm-import
     if isinstance(r.get("frame"), dict):
         r["frame"]["sha256"] = None  # the PNG can't contain its own hash
+    if isinstance(r.get("vlm_input"), dict):
+        r["vlm_input"]["sha256"] = None  # nor can a band PNG
     return r
 
 
@@ -725,23 +802,26 @@ def check_segment_png(path: Path, sidecar: Mapping[str, Any], *, offset_minutes:
     The file's SHA-256 and size match frame.sha256, width and height; the embedded record matches the
     sidecar (`record_matches_embedded`) and is valid; the EXIF matches the record: GPS = camera position,
     GPSDest = segment centre with bearing and distance, DateTimeOriginal + SubSec + Offset = local time,
-    GPS date and time = UTC, ImageUniqueID from the id.
+    GPS date and time = UTC, ImageUniqueID from the id. For a band (a batch record with `vlm_input`) the
+    SHA-256 and size are vlm_input's and ImageUniqueID derives from "<id>:band" (records.image_name).
     """
     from PIL import ExifTags, Image
 
-    from .records import dms_to_deg, read_png_record, unique_id, utc_strings
+    from .records import dms_to_deg, image_name, read_png_record, unique_id, utc_strings
 
     path = Path(path)
     p: list[str] = []
     frame = sidecar.get("frame") or {}
-    if sha256_file(path) != frame.get("sha256"):
-        p.append("file SHA-256 differs from frame.sha256")
+    image = sidecar.get("vlm_input") or frame
+    what = "vlm_input" if sidecar.get("vlm_input") else "frame"
+    if sha256_file(path) != image.get("sha256"):
+        p.append(f"file SHA-256 differs from {what}.sha256")
     embedded, gps = read_png_record(path)
     with Image.open(path) as im:
         size = im.size
         exif = dict(im.getexif().get_ifd(ExifTags.IFD.Exif))
-    if size != (frame.get("width"), frame.get("height")):
-        p.append(f"image size {size} differs from frame width x height")
+    if size != (image.get("width"), image.get("height")):
+        p.append(f"image size {size} differs from {what} width x height")
     p += record_matches_embedded(sidecar, embedded)
     if embedded is not None:
         p += [f"embedded record: {x}" for x in validate_segment_record(embedded, embedded=True)]
@@ -778,7 +858,7 @@ def check_segment_png(path: Path, sidecar: Mapping[str, Any], *, offset_minutes:
         got = float(gps[G.GPSAltitude]) * (-1.0 if gps.get(G.GPSAltitudeRef) in (b"\x01", 1) else 1.0)
         if abs(got - msl) > 0.006:
             p.append(f"EXIF GPSAltitude {got} differs from camera.alt_msl_m {msl}")
-    if exif.get(ExifTags.Base.ImageUniqueID) != unique_id(sidecar["id"]):
+    if exif.get(ExifTags.Base.ImageUniqueID) != unique_id(image_name(sidecar)):
         p.append("EXIF ImageUniqueID does not derive from the record id")
     if frame.get("utc_ms") is not None:
         ts = utc_strings(frame["utc_ms"], offset_minutes)

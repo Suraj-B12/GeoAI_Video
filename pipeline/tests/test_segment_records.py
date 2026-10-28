@@ -298,7 +298,7 @@ def test_builder_rejects_inconsistent_inputs():
     args = record_args(k=0)
     with pytest.raises(ValueError, match="needs shot, camera and gate"):
         build_segment_record(**{**args, "gate": None})
-    with pytest.raises(ValueError, match="quality must have exactly"):
+    with pytest.raises(ValueError, match="quality must have the fields"):
         build_segment_record(**{**args, "quality": {**args["quality"], "extra": 1}})
     with pytest.raises(ValueError, match="outside the schema"):
         build_segment_record(**{**args, "gate": {**args["gate"], "debug": 1}})

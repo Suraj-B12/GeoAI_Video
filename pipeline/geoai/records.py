@@ -33,6 +33,12 @@ def unique_id(name: str) -> str:
     return hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
 
 
+def image_name(rec: dict) -> str:
+    """The name ImageUniqueID derives from: the record id, or "<id>:band" for a segment band."""
+    kind = (rec.get("vlm_input") or {}).get("kind")
+    return f"{rec['id']}:{kind}" if kind else rec["id"]
+
+
 def _dms(deg: float) -> tuple[IFDRational, IFDRational, IFDRational]:
     d = abs(float(deg))
     D = int(d)
@@ -75,14 +81,16 @@ def build_exif(rec: dict, make: str, model: str, software: str, offset_minutes: 
     (`rec["anomaly"]`, crop mode) or the segment centre (`rec["target"]`, segment mode). The capture time
     is the record's top-level `utc_ms` (crop mode) or, when that key is absent, `rec["frame"]["utc_ms"]`
     (segment mode keeps every time inside its frame block). Crop records always carry `utc_ms` and no
-    `target`, so their EXIF bytes are exactly what they were before segment mode existed.
+    `target`, so their EXIF bytes are exactly what they were before segment mode existed. A band of a
+    segment frame (a record with a `vlm_input` block) is another image of the same record, so its
+    ImageUniqueID derives from "<id>:<vlm_input.kind>"; everything else is the frame's.
     """
     ex = Image.Exif()
     ex[ExifTags.Base.Make] = make or "unknown"
     ex[ExifTags.Base.Model] = model or "unknown"
     ex[ExifTags.Base.Software] = software
     ex[ExifTags.Base.Orientation] = 1  # pixels are stored upright
-    exif_ifd = {ExifTags.Base.ImageUniqueID: unique_id(rec["id"])}
+    exif_ifd = {ExifTags.Base.ImageUniqueID: unique_id(image_name(rec))}
     gps: dict = {ExifTags.GPS.GPSVersionID: b"\x02\x03\x00\x00", ExifTags.GPS.GPSMapDatum: "WGS-84"}
     utc_ms = rec["utc_ms"] if "utc_ms" in rec else (rec.get("frame") or {}).get("utc_ms")
     if utc_ms is not None:

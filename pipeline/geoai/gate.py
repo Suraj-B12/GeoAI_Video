@@ -24,7 +24,9 @@ A detection (bank or crack component) belongs to it when the centre row of its b
 Decision (`SegmentGate.decide`). `send` when any of probe_frac, evidence, crack_mm reaches its
 threshold; else `audit` for a deterministic `audit_frac` of segments (SHA-256 of the record id), so
 the gate's misses can be measured without bias; else `skip`. Mode `all` sends everything and keeps
-the gate's would-be decision.
+the gate's would-be decision. A threshold of None turns its signal off; with evidence and crack_mm
+both off (`needs_bank` false) the gate runs the probe alone (`AnomalyDetector.probe_maps`), with no
+bank and no crack filter, and records the scores they would give as None.
 
 Calibration (`calibrate`). With the VLM as the reference (no labels by us), it finds the thresholds
 that keep `target_recall` of the VLM-positive segments at the lowest pass rate, per signal and for
@@ -189,7 +191,7 @@ def gate_thresholds(cfg: Config | GateConfig) -> dict:
                         cal["any_of"]["recall"], cal["target_recall"])
         return {**calibration_thresholds(cal), "audit_frac": float(g.audit_frac), "source": "calibration",
                 "calibration_file": path.name, "calibration_sha256": sha256_file(path)}
-    return {"probe_frac": float(g.probe_frac), "evidence": float(g.evidence), "crack_mm": float(g.crack_mm),
+    return {**{k: (None if getattr(g, k) is None else float(getattr(g, k))) for k in GATE_SIGNALS},
             "audit_frac": float(g.audit_frac), "source": "config"}
 
 
@@ -218,6 +220,9 @@ class SegmentGate:
         self.thresholds = {**gate_thresholds(g), "probe_seed_logit": None if probe is None else float(probe.seed_logit)}
         if probe is None and self.thresholds["probe_frac"] is not None:
             log.warning("gate: no Attain probe loaded; the probe_frac threshold can never be reached")
+        # The bank and the crack filter feed only evidence, crack_mm, z_max and anomalous_patch_frac. With
+        # the evidence and crack_mm thresholds both off nothing they score can decide, so neither is run.
+        self.needs_bank = self.thresholds["evidence"] is not None or self.thresholds["crack_mm"] is not None
         # Centre of each patch row in full-frame display rows (pixel centres at integers), by View's
         # own mapping: analysis rows [14p, 14p + 14) are frame rows v0 + [14p, 14p + 14) / sy.
         self.patch_rows_v = self.frame_row(PATCH * np.arange(detector.gh), PATCH * np.arange(1, detector.gh + 1))
@@ -225,11 +230,17 @@ class SegmentGate:
     # -- bank ------------------------------------------------------------------------------------
     def add_bank_frame(self, rgb_full: np.ndarray, s_m: float) -> None:
         """One bank frame (full resolution, display orientation) at path position s_m."""
+        self._need_bank("add_bank_frame")
         self._check_frame(rgb_full)
         self.detector.add_bank_frame(self.view.analysis_image(rgb_full), s_m, self.view.gsd_rows_mm)
 
     def finalize(self) -> None:
+        self._need_bank("finalize")
         self.detector.finalize()
+
+    def _need_bank(self, what: str) -> None:
+        if not self.needs_bank:
+            raise RuntimeError(f"gate.{what}: this gate uses the probe only (evidence and crack_mm off) and has no bank")
 
     # -- geometry --------------------------------------------------------------------------------
     def frame_row(self, y0, y1):
@@ -265,14 +276,18 @@ class SegmentGate:
         """Scores of one segment in its best frame (full resolution, display orientation).
 
         s_m: the frame's camera position on the route (bank patches within exclude_window_m of it
-        are ignored); seg_rows_full: (v_top, v_bottom) of the segment, display rows.
+        are ignored); seg_rows_full: (v_top, v_bottom) of the segment, display rows. Without a bank
+        (`needs_bank` false) only the probe runs (`AnomalyDetector.probe_maps`).
         """
         self._check_frame(rgb_full)
-        maps = self.detector.maps(self.view.analysis_image(rgb_full), s_m, self.view.gsd_rows_mm)
+        ana = self.view.analysis_image(rgb_full)
+        maps = self.detector.maps(ana, s_m, self.view.gsd_rows_mm) if self.needs_bank else self.detector.probe_maps(ana)
         return self.restrict(maps, seg_rows_full)
 
     def restrict(self, maps: dict, seg_rows_full: Sequence[float]) -> dict:
-        """The segment's scores from the detector maps of its frame (`AnomalyDetector.maps`).
+        """The segment's scores from the detector maps of its frame (`AnomalyDetector.maps`, or
+        `probe_maps`, which has no bank or crack maps: evidence, crack_mm, z_max and
+        anomalous_patch_frac are then None).
 
         probe_frac           share of the segment's patches with probe logit >= the probe's seed level
                              (paint patches never are); None without a probe
@@ -287,8 +302,7 @@ class SegmentGate:
         v_top, v_bottom = self._check_rows(seg_rows_full)
         rows = self._patch_rows(v_top, v_bottom)
         det = self.detector
-        z = np.asarray(maps["z"])[rows]
-        n = int(z.size)
+        n = int(rows.size) * det.gw
         logit = maps["probe_logit"]
         if logit is None:
             probe_frac = probe_max = None
@@ -296,6 +310,11 @@ class SegmentGate:
             lg = np.asarray(logit)[rows]
             probe_frac = int(np.count_nonzero(lg >= det.probe.seed_logit)) / n
             probe_max = float(lg.max())
+        out = {"probe_frac": probe_frac, "probe_max_logit": probe_max, "evidence": None, "crack_mm": None,
+               "z_max": None, "anomalous_patch_frac": None, "n_patches": n}
+        if "z" not in maps:
+            return out
+        z = np.asarray(maps["z"])[rows]
 
         def inside(c) -> bool:
             v = float(self.frame_row(c.bbox[1], c.bbox[3]))
@@ -303,12 +322,11 @@ class SegmentGate:
 
         comps = maps["components"]
         ev = list(comps["dino"]) + (list(comps["crack"]) if det.crack_cfg.as_candidates else [])
-        return {"probe_frac": probe_frac, "probe_max_logit": probe_max,
-                "evidence": math.fsum(float(c.score) for c in ev if inside(c)),
-                "crack_mm": math.fsum(float(c.crack_length_mm) for c in comps["crack"] if inside(c)),
-                "z_max": float(z.max()),
-                "anomalous_patch_frac": int(np.count_nonzero(z >= det.cfg.score_threshold)) / n,
-                "n_patches": n}
+        out.update({"evidence": math.fsum(float(c.score) for c in ev if inside(c)),
+                    "crack_mm": math.fsum(float(c.crack_length_mm) for c in comps["crack"] if inside(c)),
+                    "z_max": float(z.max()),
+                    "anomalous_patch_frac": int(np.count_nonzero(z >= det.cfg.score_threshold)) / n})
+        return out
 
     def decide(self, scores: dict, record_id: str) -> dict:
         """The record's `gate` block: mode, decision, decision_if_gated, reasons, scores, thresholds, audit_draw.

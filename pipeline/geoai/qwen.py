@@ -176,3 +176,70 @@ def _check(p: CropPlan, frame_w: int, frame_h: int, max_pixels: int) -> None:
     assert p.out_w <= p.box_w and p.out_h <= p.box_h, f"would enlarge: {p}"
     assert 0 <= p.box[0] < p.box[2] <= frame_w and 0 <= p.box[1] < p.box[3] <= frame_h, p
     assert smart_resize(p.out_h, p.out_w) == (p.out_h, p.out_w), f"not a fixed point: {p}"
+
+
+# ---- segment bands (docs/pipeline/13 §6, vlm.image = band) ------------------------------------------
+
+@dataclass(frozen=True)
+class BandPlan:
+    """A full-width band of a frame: rows [y0, y1) of every column, sent at full resolution.
+
+    The band is cut, never resized: the VLM's processor resizes it exactly as it resizes a whole frame
+    (`model_w` x `model_h` = smart_resize of the band), so nothing is pre-resized below what it would do.
+    """
+
+    width: int
+    y0: int
+    y1: int
+    margin_rows: int          # rows above the segment's far edge (band_margin_frac of its rows)
+    extra_rows_below: int     # rows added below the segment to reach the aspect limit
+    extra_rows_above: int     # rows added above the margin to reach the aspect limit
+    model_w: int
+    model_h: int
+
+    @property
+    def height(self) -> int:
+        return self.y1 - self.y0
+
+    @property
+    def box(self) -> tuple[int, int, int, int]:
+        return 0, self.y0, self.width, self.y1
+
+    @property
+    def tokens(self) -> int:
+        return visual_tokens(self.model_w, self.model_h)
+
+
+def plan_band(frame_w: int, frame_h: int, rows_of_segment: tuple[float, float], *, margin_frac: float = 0.10,
+              max_aspect: float = 2.94) -> BandPlan:
+    """The band that shows a segment: its rows, a margin above, full width (docs/pipeline/13 §6).
+
+    1. Segment rows: those whose centres lie in [v_top, v_bottom] (segments.SegmentGeometry.row_slice),
+       within the frame. v_bottom can lie below the last row (the nearest candidate's near edge is at the
+       bottom of the view); the band then ends at the frame's bottom.
+    2. Margin: ceil(margin_frac x segment rows) rows above the far edge, so the VLM sees the road go on
+       beyond the segment and where it ends; none below (the near edge is at or near the frame bottom).
+    3. Aspect: at most max_aspect (width / height). A shorter band grows downwards first, to the frame's
+       bottom (rows below the near edge cover millimetres of road each, so they add the least road from
+       outside the segment), then upwards.
+    """
+    if frame_w < FACTOR or frame_h < 1:
+        raise ValueError(f"frame too small: {frame_w}x{frame_h}")
+    if not margin_frac >= 0 or not max_aspect >= 1:
+        raise ValueError(f"band margin must be >= 0 and aspect >= 1, got {margin_frac}, {max_aspect}")
+    v_top, v_bottom = (float(v) for v in rows_of_segment)
+    if not (math.isfinite(v_top) and math.isfinite(v_bottom) and v_top < v_bottom):
+        raise ValueError(f"rows_of_segment must be finite with v_top < v_bottom, got {rows_of_segment}")
+    r0 = max(0, math.ceil(v_top))
+    r1 = min(frame_h, math.floor(v_bottom) + 1)
+    if r1 <= r0:
+        raise ValueError(f"segment rows {rows_of_segment} are not inside a {frame_w}x{frame_h} frame")
+    margin = min(r0, math.ceil(margin_frac * (r1 - r0) - 1e-9))
+    y0, y1 = r0 - margin, r1
+    h_min = min(frame_h, math.ceil(frame_w / max_aspect - 1e-9))
+    below = min(frame_h - y1, max(0, h_min - (y1 - y0)))
+    y1 += below
+    above = max(0, h_min - (y1 - y0))
+    y0 -= above
+    mh, mw = smart_resize(y1 - y0, frame_w)
+    return BandPlan(frame_w, y0, y1, margin, below, above, mw, mh)

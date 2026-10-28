@@ -14,6 +14,10 @@ A batch holds runs of one mode (report.json `mode`), never both:
   its evaluation on whole road frames. The batch also carries every segment record of every status
   (records/<id>.json) and each run's report.json (runs/<session_id>/report.json). `vlm-import` and
   `analyze` therefore need only the batch folder.
+  With vlm.image = band, the request (kind "segment_band") is instead a full-width band of that frame:
+  the segment's rows plus a margin above the far edge (qwen.plan_band), cut from the frame's PNG pixels
+  without resizing and written as its own lossless PNG with the frame's EXIF and the record, which then
+  carries a `vlm_input` block (the box, sizes and model input). A batch holds one image kind.
 
 Facts used from the VLM team's answers (vlm_handoff/vlm-information-response.md):
 - /classify takes multipart field "file" and returns JSON with stage1_label, stage1_confidence,
@@ -41,7 +45,7 @@ import numpy as np
 
 from . import __version__
 from .config import Config
-from .qwen import frame_input_size
+from .qwen import frame_input_size, plan_band
 from .segment_records import (SENT_STATUSES, STATUSES, load_segment_records, segment_feature, segment_row,
                               validate_segment_record, write_feature_collection, write_segment_outputs, write_table_csv)
 from .util import sha256_file, to_json, write_json_atomic
@@ -52,6 +56,7 @@ SEGMENT_STATUSES = SENT_STATUSES       # segment statuses a batch can carry (ski
 SERVER_MAX_UPLOAD_BYTES = 10_000_000   # /classify upload limit "10 MB" (notes 1.3), read as the smaller decimal MB
 SERVER_MAX_SIDE_PX = 4096              # /classify accepts 32x32 .. 4096x4096 (notes 1.3)
 SECONDS_PER_IMAGE = 14.0               # middle of the measured 11-18 s per image (notes 1.6)
+IMAGE_KINDS = {"frame": "segment", "band": "segment_band"}  # vlm.image -> request kind of a segment batch
 _COPY_CHUNK = 1 << 20
 
 
@@ -67,12 +72,15 @@ def run_mode(run_dir: Path) -> str:
 
 
 def export_batch(run_dirs: list[Path], batch_dir: Path, cfg: Config, *, include_frames: bool | None = None,
-                 statuses: Sequence[str] | None = None) -> dict:
+                 statuses: Sequence[str] | None = None, ids: Iterable[str] | None = None) -> dict:
     """Write a VLM batch for the runs (see the module docstring); returns batch.json.
 
     statuses: record statuses to send. Default: ("sent",) for crop runs, ("send", "audit") for segment
         runs, which may only use those two.
     include_frames: crop runs only; default cfg.crop.full_frame.
+    ids: segment runs only: send only these record ids (e.g. a sample for an A/B test). Every record still
+        travels with the batch; the others are "not requested" in the analysis. An id that is not a sent
+        record of the runs is an error.
     A failed export removes what it wrote (the folder was empty or absent), so it can simply be rerun.
     """
     batch_dir = Path(batch_dir)
@@ -85,7 +93,10 @@ def export_batch(run_dirs: list[Path], batch_dir: Path, cfg: Config, *, include_
         raise ValueError("a batch holds either crop runs or segment runs, not both")
     try:
         if modes == {"segments"}:
-            return _export_segments(runs, batch_dir, cfg, SEGMENT_STATUSES if statuses is None else tuple(statuses))
+            return _export_segments(runs, batch_dir, cfg, SEGMENT_STATUSES if statuses is None else tuple(statuses),
+                                    None if ids is None else set(ids))
+        if ids is not None:
+            raise ValueError("ids apply to segment runs only")
         return _export_crops(runs, batch_dir, cfg, include_frames, ("sent",) if statuses is None else tuple(statuses))
     except BaseException:  # including Ctrl-C: never leave a half-written batch that looks complete
         if existed:
@@ -158,10 +169,15 @@ def _finish_batch(batch_dir: Path, batch: dict, running_txt: str) -> None:
 
 # ---- segment export ------------------------------------------------------------------------------
 
-def _export_segments(runs: list[Path], batch_dir: Path, cfg: Config, statuses: tuple[str, ...]) -> dict:
+def _export_segments(runs: list[Path], batch_dir: Path, cfg: Config, statuses: tuple[str, ...],
+                     ids: set[str] | None) -> dict:
     if not statuses or any(s not in SEGMENT_STATUSES for s in statuses):
         raise ValueError(f"segment runs can send only statuses {SEGMENT_STATUSES}, got {statuses}")
+    image = cfg.vlm.image
+    if image not in IMAGE_KINDS:
+        raise ValueError(f"vlm.image must be one of {tuple(IMAGE_KINDS)}, got {image!r}")
     (batch_dir / "images").mkdir(parents=True, exist_ok=True)
+    unmatched = set(ids) if ids is not None else set()
     requests: list[dict] = []
     sessions: list[str] = []
     by_status = {s: 0 for s in STATUSES}
@@ -188,22 +204,33 @@ def _export_segments(runs: list[Path], batch_dir: Path, cfg: Config, statuses: t
         for rec in recs:
             by_status[rec["status"]] += 1
             # The record as extracted: an answer from an earlier batch must not travel with a new one.
-            write_json_atomic(batch_dir / "records" / f"{rec['id']}.json", {k: v for k, v in rec.items() if k != "vlm"})
-            if rec["status"] in statuses:
-                req = _segment_request(run, rec, batch_dir, reencoded, not_exported)
+            out = {k: v for k, v in rec.items() if k != "vlm"}
+            if rec["status"] in statuses and (ids is None or rec["id"] in ids):
+                unmatched.discard(rec["id"])
+                if image == "band":
+                    req = _band_request(run, out, batch_dir, cfg, reencoded, not_exported)
+                else:
+                    req = _segment_request(run, rec, batch_dir, reencoded, not_exported)
                 if req is not None:
                     requests.append(req)
+            write_json_atomic(batch_dir / "records" / f"{rec['id']}.json", out)
+    if unmatched:
+        raise ValueError(f"{len(unmatched)} ids are not sent records ({'/'.join(statuses)}) of these runs, "
+                         f"e.g. {sorted(unmatched)[:3]}")
     _write_requests(batch_dir, requests)
     sizes = sorted({(r["width"], r["height"]) for r in requests})
     nbytes = [(batch_dir / r["image"]).stat().st_size for r in requests]
     batch = {
         "schema": BATCH_SCHEMA, "batch_id": batch_dir.name, "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "pipeline_version": __version__, "mode": "segments", "sessions": sessions, "statuses": list(statuses),
+        "image": image, **({"band": {"margin_frac": cfg.vlm.band_margin_frac, "max_aspect": cfg.vlm.band_max_aspect}}
+                           if image == "band" else {}),
+        **({"ids_requested": len(ids)} if ids is not None else {}),
         "n_records": sum(by_status.values()), "records_by_status": by_status,
         "n_requests": len(requests), "n_segments": len(requests), "n_crops": 0, "n_frames": 0,
         "requests_by_status": {s: sum(1 for r in requests if r["status"] == s) for s in statuses},
         "expected_model_id": cfg.vlm.model_id, "expected_prompt_version": cfg.vlm.prompt_version,
-        "image_rules": _segment_image_rules(sizes),
+        "image_rules": _segment_image_rules(sizes, image, cfg),
         "model_input_sizes": {f"{w}x{h}": list(frame_input_size(w, h)) for w, h in sizes},
         "max_upload_bytes": SERVER_MAX_UPLOAD_BYTES, "image_bytes_total": sum(nbytes),
         "image_bytes_max": max(nbytes, default=0), "reencoded": reencoded, "not_exported": not_exported,
@@ -211,6 +238,72 @@ def _export_segments(runs: list[Path], batch_dir: Path, cfg: Config, statuses: t
     }
     _finish_batch(batch_dir, batch, _running_txt_segments(batch, sizes))
     return batch
+
+
+def _band_request(run: Path, rec: dict, batch_dir: Path, cfg: Config, reencoded: list[str],
+                  not_exported: list[dict]) -> dict | None:
+    """Cut one segment's band from its frame (checked against the record), write it, and describe the request.
+
+    The pixels are the frame PNG's rows [y0, y1), unchanged (checked after writing). The band PNG gets the
+    frame's EXIF and, embedded, the record with its `vlm_input` block; `rec` (the batch's copy) gets the
+    block with the band's SHA-256.
+    """
+    from PIL import Image
+
+    from .records import write_png
+
+    rid, fr = rec["id"], rec["frame"]
+    src = run / fr["file"]
+    if sha256_file(src) != fr["sha256"]:
+        raise ValueError(f"{src} does not match frame.sha256 of its record (was the run re-processed?)")
+    with Image.open(src) as im:
+        if im.mode != "RGB" or im.size != (fr["width"], fr["height"]):
+            raise ValueError(f"{src} is {im.mode} {im.size[0]}x{im.size[1]}, its record says RGB "
+                             f"{fr['width']}x{fr['height']}")
+        rgb = np.asarray(im)
+    plan = plan_band(fr["width"], fr["height"], tuple(fr["rows_of_segment"]), margin_frac=cfg.vlm.band_margin_frac,
+                     max_aspect=cfg.vlm.band_max_aspect)
+    band = rgb[plan.y0:plan.y1]
+    v_top, v_bottom = fr["rows_of_segment"]
+    rel = f"images/{rid}.png"
+    rec["vlm_input"] = {
+        "kind": "band", "file": rel, "sha256": None, "box": list(plan.box), "width": plan.width,
+        "height": plan.height, "model_input": [plan.model_w, plan.model_h], "tokens": plan.tokens,
+        "rows_of_segment": [float(v_top) - plan.y0, float(v_bottom) - plan.y0],
+        "margin_frac": float(cfg.vlm.band_margin_frac), "margin_rows": plan.margin_rows,
+        "extra_rows_below": plan.extra_rows_below, "extra_rows_above": plan.extra_rows_above,
+        "max_aspect": float(cfg.vlm.band_max_aspect)}
+    problems = validate_segment_record(rec, embedded=True)
+    if problems:
+        raise ValueError(f"band record {rid} is invalid: {'; '.join(problems)}")
+    dst = batch_dir / rel
+    dev = rec.get("device") or {}
+    write_png(dst, band, rec, make=dev.get("manufacturer") or "", model=dev.get("model") or "",
+              software=cfg.output.software, offset_minutes=cfg.output.utc_offset_minutes,
+              compress_level=cfg.crop.png_compress_level)
+    with Image.open(dst) as im:
+        if not np.array_equal(np.asarray(im), band):
+            raise RuntimeError(f"{dst}: the written band differs from the frame's pixels")
+    if max(plan.width, plan.height) > SERVER_MAX_SIDE_PX:
+        dst.unlink()
+        not_exported.append({"id": rid, "reason": f"band {plan.width}x{plan.height} is larger than the server's "
+                                                  f"{SERVER_MAX_SIDE_PX} px limit"})
+        del rec["vlm_input"]
+        return None
+    if dst.stat().st_size > SERVER_MAX_UPLOAD_BYTES:
+        _reencode_png(dst)
+        if dst.stat().st_size > SERVER_MAX_UPLOAD_BYTES:
+            not_exported.append({"id": rid, "reason": f"{dst.stat().st_size} bytes after lossless re-encoding, "
+                                                      f"over the server's {SERVER_MAX_UPLOAD_BYTES} byte limit"})
+            dst.unlink()
+            del rec["vlm_input"]
+            return None
+        reencoded.append(rid)
+    sha = sha256_file(dst)
+    rec["vlm_input"]["sha256"] = sha
+    return {"request_id": rid, "kind": "segment_band", "image": rel, "image_sha256": sha, "width": plan.width,
+            "height": plan.height, "session_id": rec["session_id"], "record_id": rid, "frame_request_id": None,
+            "status": rec["status"], "model_input": [plan.model_w, plan.model_h]}
 
 
 def _segment_request(run: Path, rec: dict, batch_dir: Path, reencoded: list[str], not_exported: list[dict]) -> dict | None:
@@ -281,7 +374,16 @@ def _reencode_png(path: Path) -> None:
     tmp.replace(path)
 
 
-def _segment_image_rules(sizes: list[tuple[int, int]]) -> str:
+def _segment_image_rules(sizes: list[tuple[int, int]], image: str = "frame", cfg: Config | None = None) -> str:
+    if image == "band":
+        ws = sorted({w for w, _ in sizes})
+        hs = [h for _, h in sizes]
+        rng = f"{'/'.join(map(str, ws))} x {min(hs)}-{max(hs)}" if sizes else "no images"
+        return ("PNG, sRGB, upright, lossless: a full-width band of the camera frame, the road segment's rows plus "
+                f"{100 * cfg.vlm.band_margin_frac:g} % of them above its far edge (aspect at most "
+                f"{cfg.vlm.band_max_aspect:g}:1), cut from the full-resolution frame without resizing ({rng} px). "
+                "The VLM's processor resizes it itself (aspect ratio kept, both sides multiples of 28, at most "
+                "1,048,576 px; each request's model_input). Do not resize or re-encode.")
     resized = ", ".join(f"{w}x{h} -> {mw}x{mh}" for (w, h), (mw, mh) in
                         ((s, frame_input_size(*s)) for s in sizes)) or "no images"
     return ("PNG, sRGB, upright, lossless: the whole camera frame at full resolution. The VLM's processor resizes "
@@ -342,9 +444,19 @@ the images from the VLM machine afterwards (the full frames may show vehicles or
 
 def _running_txt_segments(batch: dict, sizes: list[tuple[int, int]]) -> str:
     n = batch["n_requests"]
-    dims = ", ".join(f"{w}x{h}" for w, h in sizes) or "none"
-    model_in = ", ".join(f"{w}x{h} -> {mw}x{mh}" for (w, h), (mw, mh) in ((s, frame_input_size(*s)) for s in sizes))
-    return f"""GeoAI VLM batch {batch['batch_id']} - {n} road-segment frames from {len(batch['sessions'])} session(s)
+    if batch.get("image") == "band":
+        noun = "road-segment bands"
+        what = ("Images are full-width bands of the camera frames (each road segment's rows plus a margin above),\n"
+                f"cut without resizing, lossless PNG, at most {batch['image_bytes_max'] / 1e6:.1f} MB each. Your "
+                "processor resizes them\nitself (requests.jsonl `model_input`): please don't resize or re-encode them.")
+    else:
+        noun = "road-segment frames"
+        dims = ", ".join(f"{w}x{h}" for w, h in sizes) or "none"
+        model_in = ", ".join(f"{w}x{h} -> {mw}x{mh}" for (w, h), (mw, mh) in ((s, frame_input_size(*s)) for s in sizes))
+        what = (f"Images are whole camera frames at full resolution ({dims}), lossless PNG, at most\n"
+                f"{batch['image_bytes_max'] / 1e6:.1f} MB each. Your processor resizes them itself ({model_in or 'none'}), "
+                "exactly as in\nyour evaluation on whole road frames: please don't resize or re-encode them.")
+    return f"""GeoAI VLM batch {batch['batch_id']} - {n} {noun} from {len(batch['sessions'])} session(s)
 
 On the VLM machine, with the classifier server running (POST /classify on port 8000):
 
@@ -362,9 +474,7 @@ Options: --url http://127.0.0.1:8000  --api-key KEY  --timeout 300  --limit N
 Expected model: {batch['expected_model_id']}
 Expected prompt version: {batch['expected_prompt_version']}
 
-Images are whole camera frames at full resolution ({dims}), lossless PNG, at most
-{batch['image_bytes_max'] / 1e6:.1f} MB each. Your processor resizes them itself ({model_in or 'none'}), exactly as in
-your evaluation on whole road frames: please don't resize or re-encode them. Copy the whole folder
+{what} Copy the whole folder
 back when done, and please delete the images from the VLM machine afterwards (the frames may show
 vehicles or people).
 """
@@ -504,12 +614,16 @@ def answer_class(res: Mapping[str, Any] | None, allowed: Iterable[str]) -> tuple
 
 
 def vlm_block(res: Mapping[str, Any], batch_id: str) -> dict:
-    """The record's `vlm` block (segment_records.VLM_FIELDS) from one parsed answer."""
-    return {"labels": list(res["labels"]), "stage1_label": res.get("stage1_label"),
-            "stage1_confidence": res.get("stage1_confidence"), "severity": res.get("severity"),
-            "description": res.get("description"), "valid": bool(res["valid"]), "problem": res["problem"],
-            "stage2_confidence": res.get("stage2_confidence"), "needs_expert_review": res.get("needs_expert_review"),
-            "batch_id": batch_id}
+    """The record's `vlm` block (segment_records.VLM_FIELDS) from one parsed answer; an answer to a band
+    request also says so (`image: "band"`, segment_records.VLM_OPTIONAL)."""
+    block = {"labels": list(res["labels"]), "stage1_label": res.get("stage1_label"),
+             "stage1_confidence": res.get("stage1_confidence"), "severity": res.get("severity"),
+             "description": res.get("description"), "valid": bool(res["valid"]), "problem": res["problem"],
+             "stage2_confidence": res.get("stage2_confidence"), "needs_expert_review": res.get("needs_expert_review"),
+             "batch_id": batch_id}
+    if res.get("kind") == "segment_band":
+        block["image"] = "band"
+    return block
 
 
 def health_identity(run_info: Mapping[str, Any], cfg: Config) -> dict:

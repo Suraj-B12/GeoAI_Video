@@ -1,4 +1,6 @@
 """Folder-batch round trip against a fake classifier server that mimics the VLM team's API."""
+import email.parser
+import importlib.util
 import json
 import subprocess
 import sys
@@ -28,6 +30,8 @@ ANSWERS = {
 
 class _Handler(BaseHTTPRequestHandler):
     calls = []
+    bodies = []            # (Content-Type header, raw body) of every POST
+    echo_profile = False   # True: answer like the VLM server that knows request profiles
 
     def log_message(self, *a):
         pass
@@ -53,9 +57,22 @@ class _Handler(BaseHTTPRequestHandler):
         name = body.split(b'filename="', 1)[1].split(b'"', 1)[0].decode()
         assert b"\x89PNG" in body
         _Handler.calls.append(name)
+        _Handler.bodies.append((self.headers["Content-Type"], body))
         ans = ANSWERS.get(name, {"distress_types": ["Normal"]})
+        extra = {}
+        if _Handler.echo_profile:
+            fields = _form_fields(self.headers["Content-Type"], body)
+            if "profile" in fields:
+                extra = {"profile": fields["profile"].decode(), "views_recorded": fields["profile"] != b"video"}
         self._send(200, {"stage1_confidence": 0.9, "stage2_confidence": 0.8, "needs_expert_review": False,
-                         "description": "fake", **ans})
+                         "description": "fake", **ans, **extra})
+
+
+def _form_fields(content_type: str, body: bytes) -> dict:
+    """Multipart form fields by name, parsed with the standard library's MIME parser (independent of the runner)."""
+    msg = email.parser.BytesParser().parsebytes(b"Content-Type: " + content_type.encode() + b"\r\n\r\n" + body)
+    return {part.get_param("name", header="content-disposition"): part.get_payload(decode=True)
+            for part in msg.get_payload()}
 
 
 @pytest.fixture()
@@ -63,7 +80,7 @@ def server():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
-    _Handler.calls = []
+    _Handler.calls, _Handler.bodies, _Handler.echo_profile = [], [], False
     yield f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
 
@@ -161,3 +178,98 @@ def test_health_identity_of_the_real_server():
     assert ident["prompt_matches"] is False
     assert health_identity({"health": dict(real, prompts_version="v2:0000000000000000")}, cfg)["prompt_matches"] is False
     assert health_identity({"health": {}}, cfg)["prompt_matches"] is None
+
+
+def _batch(tmp_path: Path, name: str) -> Path:
+    batch = tmp_path / name
+    export_batch([_fake_run(tmp_path)], batch, Config())
+    return batch
+
+
+def _runner_module(batch: Path):
+    spec = importlib.util.spec_from_file_location("runner_opts", batch / "run_vlm_batch.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_runner_profile_field(tmp_path, server):
+    batch = _batch(tmp_path, "batch_p")
+    _Handler.echo_profile = True
+    # No --min-interval: the URL is 127.0.0.1, so the runner does not pace (the server exempts loopback).
+    r = subprocess.run([sys.executable, str(batch / "run_vlm_batch.py"), str(batch), "--url", server,
+                        "--profile", "video"], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "did not confirm" not in r.stderr
+    images = {p.name: p.read_bytes() for p in (batch / "images").glob("*.png")}
+    assert len(_Handler.bodies) == 6
+    for ctype, body in _Handler.bodies:
+        fields = _form_fields(ctype, body)
+        assert fields["profile"] == b"video"
+        name = body.split(b'filename="', 1)[1].split(b'"', 1)[0].decode()
+        assert fields["file"] == images[name]     # the image arrives byte-exact next to the field
+    lines = [json.loads(x) for x in (batch / "responses.jsonl").read_text().splitlines()]
+    assert {ln["response"]["profile"] for ln in lines} == {"video"} and all(ln["error"] is None for ln in lines)
+    run = json.loads((batch / "vlm_run.json").read_text())["runs"][-1]
+    assert (run["profile"], run["min_interval_s"], run["batch_check"], run["profile_not_confirmed"]) == (
+        "video", 0.0, "verified", 0)
+    assert run["runner_version"] == "3"
+
+
+def test_runner_without_profile_sends_only_the_file(tmp_path, server):
+    batch = _batch(tmp_path, "batch_np")
+    r = _run_runner(batch, server, "--limit", "2")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert len(_Handler.bodies) == 2
+    for ctype, body in _Handler.bodies:
+        assert list(_form_fields(ctype, body)) == ["file"]
+    run = json.loads((batch / "vlm_run.json").read_text())["runs"][-1]
+    assert run["profile"] is None and "profile_not_confirmed" not in run
+
+
+def test_runner_warns_when_server_ignores_profile(tmp_path, server):
+    batch = _batch(tmp_path, "batch_old")
+    r = _run_runner(batch, server, "--profile", "video", "--limit", "3")   # this fake does not echo it
+    assert r.returncode == 1 and "did not confirm profile 'video'" in r.stderr
+    assert r.stderr.count("did not confirm") == 1
+    run = json.loads((batch / "vlm_run.json").read_text())["runs"][-1]
+    assert run["profile_not_confirmed"] == 3 and run["ok"] == 3
+
+
+@pytest.mark.parametrize("url, extra, interval", [
+    ("http://127.0.0.1:8000", [], 0.0),
+    ("http://localhost:8000", [], 0.0),
+    ("http://[::1]:8000", [], 0.0),
+    ("http://127.0.0.1:8000", ["--min-interval", "3"], 3.0),   # an explicit value wins
+    ("http://192.168.1.20:8000", [], 6.5),                      # another machine: 60 s / 10 requests
+    ("https://abc.trycloudflare.com", [], 6.5),
+])
+def test_runner_default_interval(tmp_path, url, extra, interval):
+    batch = _batch(tmp_path, "batch_i")
+    runner = _runner_module(batch)
+    seen = []
+    runner.run = lambda d, a: seen.append(a) or 0
+    assert runner.main([str(batch), "--url", url, *extra]) == 0
+    assert seen[0].min_interval == interval and seen[0].profile is None and seen[0].skip_batch_check is False
+
+
+def test_runner_skip_batch_check(tmp_path, server):
+    batch = _batch(tmp_path, "batch_s")
+    imgs = sorted((batch / "images").glob("*.png"))
+    data = bytearray(imgs[0].read_bytes())
+    data[-20] ^= 0xFF
+    imgs[0].write_bytes(bytes(data))
+    r = _run_runner(batch, server)
+    assert r.returncode == 2 and "SHA256SUMS" in r.stderr and not _Handler.calls   # default: verified, refused
+    r = _run_runner(batch, server, "--skip-batch-check")
+    assert "against SHA256SUMS ..." not in r.stdout and "not re-checking SHA256SUMS" in r.stdout
+    # The changed image is still caught by the per-upload hash: recorded as an error, never as answered.
+    lines = {json.loads(x)["request_id"]: json.loads(x) for x in (batch / "responses.jsonl").read_text().splitlines()}
+    reqs = {json.loads(x)["image"]: json.loads(x)["request_id"]
+            for x in (batch / "requests.jsonl").read_text().splitlines()}
+    bad_id = reqs[f"images/{imgs[0].name}"]
+    assert lines[bad_id]["error"] == "image checksum differs from requests.jsonl (file changed on disk)"
+    assert sum(ln["error"] is None for ln in lines.values()) == 5
+    assert r.returncode == 1
+    run = json.loads((batch / "vlm_run.json").read_text())["runs"][-1]
+    assert run["batch_check"] == "skipped"

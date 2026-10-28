@@ -508,14 +508,20 @@ def _resolution_mm(rec: Mapping[str, Any]) -> float | None:
     """Mean along-track ground size of one model-input pixel over the segment (mm), for a sent segment.
 
     (far - near) metres span (v_bottom - v_top) frame rows; the VLM's processor scales rows by
-    model_height / height (qwen.smart_resize). A computed counterpart of the spec's quoted figures.
+    model_height / height (qwen.smart_resize) of the image it was sent: the whole frame, or the band of a
+    record with a `vlm_input` block (same rows, a shorter image, so finer). A computed counterpart of the
+    spec's quoted figures.
     """
     f = rec.get("frame") or {}
     rows = f.get("rows_of_segment")
     if not rows or rows[1] <= rows[0]:
         return None
-    _, mh = frame_input_size(f["width"], f["height"])
-    return (f["far_edge_ahead_m"] - f["near_edge_ahead_m"]) * 1000.0 / ((rows[1] - rows[0]) * mh / f["height"])
+    band = rec.get("vlm_input")
+    if band:
+        mh, h = band["model_input"][1], band["height"]
+    else:
+        (_, mh), h = frame_input_size(f["width"], f["height"]), f["height"]
+    return (f["far_edge_ahead_m"] - f["near_edge_ahead_m"]) * 1000.0 / ((rows[1] - rows[0]) * mh / h)
 
 
 def report_md(data: BatchData, summary: pd.DataFrame, km: pd.DataFrame, gate: dict, timing: dict, cfg: Config) -> str:
@@ -562,11 +568,17 @@ def report_md(data: BatchData, summary: pd.DataFrame, km: pd.DataFrame, gate: di
     far = [r["frame"]["far_edge_ahead_m"] for r in sent_recs]
     res_mm = [v for v in (_resolution_mm(r) for r in sent_recs) if v is not None]
     modes = sorted({r["gate"]["mode"] for r in recs if r.get("gate")})
+    choices = sorted({(r.get("quality") or {}).get("choice", "sharpest") for r in recs if r.get("frame")})
+    choice_text = ("the nearest frame among those that show the whole segment nearest the camera whose sharpness on a "
+                   "common 4 mm ground grid of the segment's first metre is within 10 % of the best of them"
+                   if choices == ["nearest_sharp"] else
+                   "the sharpest frame among those that show the whole segment nearest the camera (normalised "
+                   "Tenengrad of the segment's rows)" if choices in ([], ["sharpest"]) else
+                   f"frames chosen by several rules ({', '.join(choices)})")
     thresholds = sorted({json.dumps(r["gate"]["thresholds"], sort_keys=True) for r in recs if r.get("gate")})
     L += [f"- **Segments.** The road is cut into segments of {', '.join(_f(x, 2, ' m') for x in lengths) or '-'} "
           "of GNSS path distance; a shorter last segment is kept when at least half as long and is weighted "
-          "by its real length. For each segment the sharpest frame among those that show the whole segment "
-          "nearest the camera is chosen (normalised Tenengrad of the segment's rows), avoiding predicted "
+          f"by its real length. For each segment {choice_text} is chosen, avoiding predicted "
           "motion and rotation blur.",
           f"- **Viewing distance.** In the sent frames the segment's near edge was a median "
           f"{_f(float(np.median(near)) if near else None, 2)} m and its far edge {_f(float(np.median(far)) if far else None, 2)} m "

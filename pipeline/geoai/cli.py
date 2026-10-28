@@ -32,6 +32,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--batch", type=Path, required=True)
     p.add_argument("--no-frames", action="store_true", help="crop runs: don't send the full frame of each crop")
     p.add_argument("--include-over-budget", action="store_true", help="crop runs: also send over-budget crops")
+    p.add_argument("--image", choices=("frame", "band"), default=None,
+                   help="segment runs: send the whole frame or the segment's band (default: config vlm.image)")
+    p.add_argument("--ids", type=Path, default=None,
+                   help="segment runs: send only the record ids listed in this file (one per line)")
 
     p = sub.add_parser("vlm-import", help="answered VLM batch -> validated results")
     p.add_argument("batch", type=Path)
@@ -70,13 +74,20 @@ def main(argv: list[str] | None = None) -> int:
         if {run_mode(r) for r in a.runs} == {"segments"}:
             if a.no_frames or a.include_over_budget:
                 ap.error("--no-frames and --include-over-budget apply to crop runs only")
-            b = export_batch(a.runs, a.batch, cfg)
-            print(f"batch {b['batch_id']}: {b['n_segments']} segment frames {b['requests_by_status']} from "
+            if a.image:
+                cfg.vlm.image = a.image
+            ids = None
+            if a.ids:
+                ids = [x.strip() for x in a.ids.read_text(encoding="utf-8").splitlines() if x.strip()]
+            b = export_batch(a.runs, a.batch, cfg, ids=ids)
+            print(f"batch {b['batch_id']}: {b['n_segments']} segment {b['image']}s {b['requests_by_status']} from "
                   f"{len(b['sessions'])} session(s), {b['image_bytes_total'] / 1e9:.2f} GB, "
                   f"~{b['estimated_vlm_hours']:.1f} h of VLM time -> {a.batch}")
             if b["not_exported"]:
                 print(f"not exported: {b['not_exported']}", file=sys.stderr)
             return 0
+        if a.image or a.ids:
+            ap.error("--image and --ids apply to segment runs only")
         statuses = ("sent", "over_budget") if a.include_over_budget else ("sent",)
         b = export_batch(a.runs, a.batch, cfg, include_frames=False if a.no_frames else None, statuses=statuses)
         print(f"batch {b['batch_id']}: {b['n_crops']} crops + {b['n_frames']} frames -> {a.batch}")

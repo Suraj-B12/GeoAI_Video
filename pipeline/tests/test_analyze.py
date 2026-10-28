@@ -666,7 +666,7 @@ def test_runner_streams_retries_and_resumes(tmp_path, server):
     assert att[rid("SESS_A", 0)] == 2 and att[rid("SESS_A", 1)] == 2 and att[rid("SESS_A", 2)] == 1
     assert sorted(set(_Server.calls)) == sorted(_Server.images) and len(_Server.calls) == 16
     log = json.loads((batch / "vlm_run.json").read_text(encoding="utf-8"))
-    assert len(log["runs"]) == 2 and [x["ok"] for x in log["runs"]] == [3, 11] and log["runs"][1]["runner_version"] == "2"
+    assert len(log["runs"]) == 2 and [x["ok"] for x in log["runs"]] == [3, 11] and log["runs"][1]["runner_version"] == "3"
     s = import_batch(batch, [], Config())
     assert (s["answered"], s["missing"], s["valid"]) == (14, 0, 14)
     a = analyze(batch)

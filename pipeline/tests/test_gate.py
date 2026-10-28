@@ -6,6 +6,7 @@
 - The gate view, a segment's patch rows and its scores, against independent calculations (the
   analysis camera model, brute-force loops), and on rendered frames with a real DINOv2 bank.
 - The decision rule, mode `all`, the deterministic audit draw and its rate.
+- A probe-only gate (evidence and crack_mm off): no bank, no crack filter, the probe scores of `maps`.
 - Calibration against exhaustive search and hand-computed answers, its edge cases, the JSON round trip.
 """
 import hashlib
@@ -424,6 +425,27 @@ def test_maps_equals_first_version_without_crack_candidates_or_probe(scene, dete
         det.crack_cfg, det.probe = crack_cfg, probe
 
 
+@needs_dino
+def test_probe_maps_are_the_probe_part_of_maps_without_a_bank(scene, detector):
+    """probe_maps gives maps' probe logits and paint mask bit for bit (maps is checked against the first
+    version above), and works on a detector that has no bank frame and was never finalized."""
+    det, gsd = detector
+    fresh = AnomalyDetector(det.features, WIN_H, WIN_W, det.cfg, det.crack_cfg)
+    assert fresh.bank.n_frames == 0
+    for along in ALONGS:
+        rgb = _window(scene, along)
+        m = det.maps(rgb, along, gsd)
+        for d in (det, fresh):
+            pm = d.probe_maps(rgb)
+            assert set(pm) == {"probe_logit", "paint"}
+            assert np.array_equal(pm["probe_logit"], m["probe_logit"]) and np.array_equal(pm["paint"], m["paint"])
+    fresh.probe = None
+    calls = []
+    fresh.features = lambda x: calls.append(x)              # without a probe DINOv2 is not run at all
+    pm = fresh.probe_maps(_window(scene, 3.0))
+    assert pm["probe_logit"] is None and pm["paint"].shape == (fresh.gh, fresh.gw) and calls == []
+
+
 # ==== the gate view ===============================================================================
 
 def _near(model: CameraModel, cfg: Config) -> float:
@@ -623,6 +645,57 @@ def test_segment_rows_errors(s21_view):
     bad = SimpleNamespace(**{**vars(_stub(view)), "gw": 3})
     with pytest.raises(ValueError):
         SegmentGate(bad, view, cfg)
+
+
+def _probe_only_cal(path: Path, probe_frac: float | None) -> Path:
+    """A calibration file that turns evidence and crack_mm off (the shape gate-calibrate writes)."""
+    write_calibration(path, {"schema": CALIBRATION_SCHEMA, "target_recall": 0.9, "n_rows": 10, "n_positive": 3,
+                             "any_of": {"status": "ok", "recall": 1.0,
+                                        "thresholds": {"probe_frac": probe_frac, "evidence": None, "crack_mm": None}}})
+    return path
+
+
+def test_probe_only_gate_has_no_bank_and_scores_the_probe_alone(s21_view, tmp_path):
+    """With evidence and crack_mm off the gate never touches the bank or the crack filter: score() takes the
+    probe map from probe_maps(), the bank-dependent scores are None, and the decision is the probe's."""
+    cfg, near, view = s21_view
+    gh, gw = view.ana_h // PATCH, view.ana_w // PATCH
+    logit = np.random.default_rng(5).normal(0.0, 0.3, (gh, gw)).astype(np.float32)
+    calls = []
+
+    def probe_maps(ana):
+        calls.append(ana.shape)
+        return {"probe_logit": logit, "paint": np.zeros((gh, gw), bool)}
+
+    def maps(*a):
+        raise AssertionError("the bank path must not run")
+
+    det = SimpleNamespace(**vars(_stub(view)), probe_maps=probe_maps, maps=maps)
+    gcfg = load_config(overrides={"gate": {"calibration": str(_probe_only_cal(tmp_path / "c.json", 0.02)),
+                                           "audit_frac": 0.0}})
+    gate = SegmentGate(det, view, gcfg)
+    assert not gate.needs_bank
+    assert gate.thresholds["evidence"] is None and gate.thresholds["crack_mm"] is None
+    for fn in (lambda: gate.add_bank_frame(np.zeros((2160, 3840, 3), np.uint8), 0.0), gate.finalize):
+        with pytest.raises(RuntimeError, match="probe only"):
+            fn()
+    d0 = near + 0.42
+    rows_full = _seg_rows(S21, d0, d0 + 5.0)
+    _, ya, _ = view.model_ana.ground_to_pixel(np.array([0.0, 0.0]), np.array([d0 + 5.0, d0]))
+    patch_rows = [p for p in range(gh) if ya[0] < PATCH * p + (PATCH - 1) / 2 <= ya[1]]
+    n = len(patch_rows) * gw
+    s = gate.score(np.zeros((2160, 3840, 3), np.uint8), 0.0, rows_full)
+    assert calls == [(view.ana_h, view.ana_w, 3)]
+    frac = sum(int(logit[p, q] >= 0.3) for p in patch_rows for q in range(gw)) / n
+    assert s == {"probe_frac": frac, "probe_max_logit": max(float(logit[p, q]) for p in patch_rows for q in range(gw)),
+                 "evidence": None, "crack_mm": None, "z_max": None, "anomalous_patch_frac": None, "n_patches": n}
+    assert 0.02 < frac < 0.5                                   # the threshold below really is crossed
+    assert gate.decide(s, "r")["reasons"] == ["probe_frac"]
+    assert gate.decide({**s, "probe_frac": 0.019}, "r")["decision"] == "skip"
+    # Either signal on keeps the bank: the configured defaults, and evidence alone.
+    assert SegmentGate(det, view, cfg).needs_bank
+    assert SegmentGate(det, view, GateConfig(crack_mm=None)).needs_bank is True
+    assert SegmentGate(det, view, GateConfig(evidence=None, crack_mm=None)).needs_bank is False
 
 
 # ==== decision ====================================================================================

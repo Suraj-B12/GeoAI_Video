@@ -49,7 +49,7 @@ Run steps 2–4 from `pipeline/` (or with the package installed). Outputs:
 
 Runner exit codes: `0` all answered; `1` some still to do (run again); `2` stopped before sending (checksums or `/health`) or on 401/403; `130` Ctrl-C.
 
-Options: `--url http://127.0.0.1:8000`, `--api-key KEY` (when the server sets `API_KEYS`), `--timeout 300`, `--limit N`, `--min-interval 6.5` (10 requests/min), `--retries 4`, `--max-failures 5`.
+Options: `--url http://127.0.0.1:8000`, `--api-key KEY` (when the server sets `API_KEYS`), `--timeout 300`, `--limit N`, `--min-interval` (default 6.5 s = 10 requests/min; 0 when `--url` is this PC, which the server does not rate-limit), `--profile video` (drive-video frames: the server skips its record-only probe tiles, same labels; measured 3.8 s instead of 13.7 s per Stage-1-Normal frame), `--skip-batch-check` (no full SHA256SUMS re-hash; only when an earlier call verified the same batch; each image is still hashed as it is sent), `--retries 4`, `--max-failures 5`.
 
 ## 4. Troubleshooting
 

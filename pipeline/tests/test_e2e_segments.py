@@ -390,6 +390,67 @@ def test_export_runner_import_analyze_calibrate(sim, tmp_path):
             assert rec["status"] == "send"
 
 
+def test_probe_only_gate_skips_bank_and_crack_filter_and_changes_nothing_else(sim, tmp_path):
+    """A calibration with evidence and crack_mm off (as gate-calibrate wrote for the S21 sessions): no bank is built,
+    the crack filter does not run, and evidence, crack_mm, z_max and anomalous_patch_frac are null. Frames,
+    probe scores and everything else equal a send-all run that builds the bank (same probe, same video), and
+    the decisions follow the probe_frac threshold and the SHA-256 audit draw, computed here. The Attain probe is
+    on: procedural asphalt is outside its domain, so this checks the mechanics, not the probe's accuracy."""
+    over = {"gnss": OVERRIDES["gnss"]}                                   # the Attain probe on
+    sess = sim["res"]["session_dir"]
+    process_session_segments(sess, tmp_path / "bank", load_config(overrides={**over, "gate": {"mode": "all"}}))
+    ref = {r["id"]: r for r in load_segment_records(run_dir(tmp_path / "bank", sim["res"]) / "sidecars")}
+    fr = sorted({r["gate"]["scores"]["probe_frac"] for r in ref.values()})
+    t = fr[len(fr) // 2]
+    cal = tmp_path / "gate_probe.json"
+    cal.write_text(json.dumps({"schema": "geoai.gate_calibration.v1", "target_recall": 0.9, "n_rows": 13, "n_positive": 4,
+                               "any_of": {"status": "ok", "recall": 1.0,
+                                          "thresholds": {"probe_frac": t, "evidence": None, "crack_mm": None}}}),
+                   encoding="utf-8")
+    cfg = load_config(overrides={**over, "gate": {"calibration": str(cal)}})
+    rep = process_session_segments(sess, tmp_path / "p1", cfg)
+    rep2 = process_session_segments(sess, tmp_path / "p2", cfg)
+    run, run2 = run_dir(tmp_path / "p1", sim["res"]), run_dir(tmp_path / "p2", sim["res"])
+    assert all(v == {"frames": 0, "built": False} for v in rep["bank"].values())
+    assert rep["timings_s"]["bank_features"] == 0.0 and rep["timings_s"]["bank_decode"] == 0.0
+    recs = load_segment_records(run / "sidecars")
+    assert [r["id"] for r in recs] == sorted(ref) and len(recs) == 13
+    statuses = set()
+    for r in recs:
+        b = ref[r["id"]]
+        assert validate_segment_record(r) == [], r["id"]
+        assert r["frame"]["frame_in_segment"] == b["frame"]["frame_in_segment"] and r["quality"] == b["quality"]
+        sc, sb = r["gate"]["scores"], b["gate"]["scores"]
+        assert (sc["probe_frac"], sc["probe_max_logit"], sc["n_patches"]) ==             (sb["probe_frac"], sb["probe_max_logit"], sb["n_patches"])
+        assert all(sc[k] is None for k in ("evidence", "crack_mm", "z_max", "anomalous_patch_frac"))
+        assert all(sb[k] is not None for k in ("evidence", "crack_mm", "z_max", "anomalous_patch_frac"))
+        th = r["gate"]["thresholds"]
+        assert (th["probe_frac"], th["evidence"], th["crack_mm"], th["source"]) == (t, None, None, "calibration")
+        draw = (int.from_bytes(hashlib.sha256(r["id"].encode()).digest()[:8], "big") >> 11) / 2 ** 53
+        want = "send" if sc["probe_frac"] >= t else ("audit" if draw < 0.10 else "skip")
+        assert r["status"] == r["gate"]["decision"] == want, r["id"]
+        statuses.add(want)
+        if want != "skip":
+            assert check_segment_png(run / r["frame"]["file"], r, offset_minutes=330) == [], r["id"]
+            with Image.open(run / r["frame"]["file"]) as a, Image.open(run_dir(tmp_path / "bank", sim["res"]) / b["frame"]["file"]) as c:
+                assert np.array_equal(np.asarray(a), np.asarray(c))
+        strip = {k: v for k, v in r.items() if k not in ("status", "gate", "config_sha256", "frame")}
+        assert strip == {k: v for k, v in b.items() if k not in ("status", "gate", "config_sha256", "frame")}
+    assert "send" in statuses
+    logs = list((tmp_path / "p1" / "logs").glob(f"*/{sess.name}.jsonl"))
+    events = [(x["stage"], x["event"]) for x in map(json.loads, logs[0].read_text(encoding="utf-8").splitlines())]
+    assert ("bank", "start") in events and ("bank", "end") in events
+    files = sorted(p.relative_to(run) for p in run.rglob("*") if p.is_file())
+    assert files == sorted(p.relative_to(run2) for p in run2.rglob("*") if p.is_file())
+    for rel in files:
+        if rel.name != "report.json":
+            assert (run / rel).read_bytes() == (run2 / rel).read_bytes(), rel
+    ra, rb = (json.loads((x / "report.json").read_text(encoding="utf-8")) for x in (run, run2))
+    for x in (ra, rb):
+        x.pop("created_utc"), x.pop("timings_s")
+    assert ra == rb and rep2["records"] == rep["records"]
+
+
 def test_cli_process_send_all_and_mode_checks(sim, tmp_path):
     over = tmp_path / "o.json"
     over.write_text(json.dumps(OVERRIDES), encoding="utf-8")

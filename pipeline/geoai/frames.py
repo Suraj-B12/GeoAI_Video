@@ -9,24 +9,30 @@
    recording (segments.plan_segments with t_span and offset_m = plan_offset_m).
 3. Bank pass: frames spread over the route (keyframes first, all frames if that gives too few, as
    in the crop mode) build the session bank of each gate view (gate.plan_segment_view, far edge
-   gate.gate_far_m of the selector's near_m).
+   gate.gate_far_m of the selector's near_m). Skipped when the gate uses the probe only (evidence
+   and crack_mm thresholds off, SegmentGate.needs_bank): nothing it would score can decide.
 4. One decode pass: every frame is described (camera position c at its centre-row time, exposure,
    low light, gyro rate) and offered to the BestFrameSelector, which asks for RGB only inside
    candidate windows. Each finished segment is scored by the gate on its best frame, decided, turned
    into a geoai.segment.v1 record, and for `send` and `audit` its frame is written in full
-   resolution as lossless PNG (record embedded, EXIF) on the PNG writer's threads.
+   resolution as lossless PNG (record embedded, EXIF) on the PNG writer's threads. Gate, record and
+   PNG submission run on one gate thread, in segment order, while the decoder goes on (_InOrder).
 5. Outputs: sidecars, segments.csv, segments.geojson, contact_sheet.jpg and report.json.
 
 Determinism. Everything a rerun writes into the run folder is byte-identical, except report.json's
 `created_utc` and `timings_s` (wall-clock measurements) and `features_device`. The bank's spacing
 jitter is seeded; the audit draw is SHA-256 of the record id; PNG, JSON, CSV and JPEG encoders are
-deterministic. Structured logs (runlog.py) go to <out_root>/logs/, outside the run folder.
+deterministic; finished segments are gated, recorded and submitted to the PNG writer by a single
+thread in the order the selector emits them, so the overlap with decoding changes timings only.
+Structured logs (runlog.py) go to <out_root>/logs/, outside the run folder.
 """
 from __future__ import annotations
 
 import json
 import math
+import queue
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +67,67 @@ _PCTS = (10, 50, 90)
 # Progress log lines at most this often. The VLM system's video toggle tails this log to show the
 # extraction live; a 2.6 km session runs ~10 min, so 2 s is smooth without flooding the log.
 PROGRESS_EVERY_S = 2.0
+# Finished segments waiting for the gate thread at most. Each holds its best frame (25 MB at 4K). On the
+# S21 sessions the gate took 0.39 s per segment with bank and crack filter (d47c: 204 s for 528) and the
+# decoder finished one segment every 0.76 s (402 s), so a short queue absorbs the slow calls; 4 bounds
+# the memory at ~100 MB.
+GATE_QUEUE = 4
+_DONE = object()
+
+
+class _InOrder:
+    """One worker thread that calls `fn` on submitted items, one at a time, in submission order.
+
+    The decode pass hands finished segments to it, so the gate (GPU, and the crack filter on the CPU)
+    runs while the next frames are decoded, and everything it does happens in the same order as in a
+    serial loop: outputs stay byte-identical. `submit` blocks while `max_pending` items wait (bounded
+    memory). An exception in `fn` stops the processing; it is raised by the next `submit` or by
+    `close`. `wait_s`: time the submitting thread spent blocked (the part of the gate not hidden).
+    """
+
+    def __init__(self, fn, max_pending: int, name: str):
+        self._fn = fn
+        self._q: queue.Queue = queue.Queue(max_pending)
+        self._error: BaseException | None = None
+        self._stop = False
+        self.wait_s = 0.0
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is _DONE:
+                return
+            if self._error is None and not self._stop:
+                try:
+                    self._fn(item)
+                except BaseException as e:  # noqa: BLE001 - handed to the submitting thread
+                    self._error = e
+
+    def _raise(self) -> None:
+        if self._error is not None:
+            raise self._error
+
+    def submit(self, item) -> None:
+        self._raise()
+        t = time.perf_counter()
+        self._q.put(item)
+        self.wait_s += time.perf_counter() - t
+
+    def close(self) -> None:
+        """Wait until every submitted item is done; raise the worker's exception, if any."""
+        t = time.perf_counter()
+        self._q.put(_DONE)
+        self._thread.join()
+        self.wait_s += time.perf_counter() - t
+        self._raise()
+
+    def abort(self) -> None:
+        """Stop after the current item, skipping the queued ones (on an error in the submitting thread)."""
+        self._stop = True
+        self._q.put(_DONE)
+        self._thread.join()
 
 
 class _Progress:
@@ -140,6 +207,22 @@ def _dist(values) -> dict:
 
 def _share(k: int, n: int) -> float | None:
     return k / n if n else None
+
+
+def _choice_summary(cfg: Config, results: list[SegmentResult]) -> dict:
+    """report.json quality fields of segments.choice = nearest_sharp (nothing for the default choice, so a
+    default report is unchanged): the rule's settings, how far ahead the chosen frames saw the segment, and
+    their fair sharpness relative to the best of their tier."""
+    sc = cfg.segments
+    if sc.choice == "sharpest":
+        return {}
+    chosen = [r for r in results if r.best is not None]
+    return {"choice": sc.choice,
+            "fair": {"rel_min": sc.fair_rel_min, "grid_mm": sc.fair_grid_mm, "strip_m": sc.fair_strip_m,
+                     "supersample": sc.fair_supersample, "half_width_m": sc.fair_half_width_m},
+            "near_edge_ahead_m": _dist(r.best.near_edge_ahead_m for r in chosen),
+            "fair_sharpness_rel": _dist(r.fair_rel for r in chosen),
+            "chosen_is_raw_sharpest_share": _share(sum(1 for r in chosen if r.sharpness_rank == 1), len(chosen))}
 
 
 # ---- main ------------------------------------------------------------------------------------
@@ -269,12 +352,17 @@ def _process(session_dir: Path, out_root: Path, cfg: Config, allow_test: bool, a
         dec = _Decode(s, traj, cfg, rs, sel, out, chainage_origin, prog)
         t_dec = time.time()
         dino_before = timed.seconds
-        for seg, path in seg_files.items():
-            dec.run_segment(seg, path, seg_res[seg], rotate180, black)
-        dec.finish()
+        try:
+            for seg, path in seg_files.items():
+                dec.run_segment(seg, path, seg_res[seg], rotate180, black)
+            dec.finish()
+        except BaseException:
+            dec.gates.abort()
+            raise
         timings["decode_pass"] = time.time() - t_dec
         timings["gate"] = dec.t_gate
         timings["gate_dinov2"] = timed.seconds - dino_before
+        timings["gate_wait"] = dec.gates.wait_s
         timings["png_wait"] = dec.t_png
         st.update(frames_decoded=dec.n_decoded, frames_rgb=dec.n_rgb, segments=len(dec.records),
                   statuses={k: sum(1 for r in dec.records if r["status"] == k) for k in STATUSES})
@@ -334,6 +422,12 @@ def _bank_pass(s: Session, traj: Trajectory, cfg: Config, rs: dict[tuple[int, in
     for r in rs.values():
         r.gate = new_gate(r)
         r.bank_frames = 0
+    if not any(r.gate.needs_bank for r in rs.values()):
+        # Probe-only gate (evidence and crack_mm off, e.g. a calibration that turned them off): no bank
+        # frame is decoded and no bank is built; the gate scores the probe only (SegmentGate.score).
+        log.info("bank: not built (the gate uses the probe only: evidence and crack_mm thresholds are off)")
+        prog.update("bank_finalize", 0, 0, force=True)
+        return {"total": time.time() - t_bank, "decode": 0.0, "features": 0.0, "finalize": 0.0}
 
     def frame_s(row: dict, r: _Res) -> float | None:
         """Path position of a usable bank frame (time of the gate view's middle row), else None."""
@@ -406,7 +500,12 @@ def _bank_pass(s: Session, traj: Trajectory, cfg: Config, rs: dict[tuple[int, in
 # ---- decode pass -----------------------------------------------------------------------------
 
 class _Decode:
-    """The one decode pass: frames -> selector -> finished segments -> gate -> records and PNGs."""
+    """The one decode pass: frames -> selector -> finished segments -> gate -> records and PNGs.
+
+    The calling thread decodes and selects; `_segment` (gate, record, PNG submission) runs on the
+    `gates` thread in segment order. Shared state is read-only there (trajectory, geometry, selector
+    constants), except the outputs, which only that thread writes until `finish` has joined it.
+    """
 
     def __init__(self, s: Session, traj: Trajectory, cfg: Config, rs: dict[tuple[int, int], _Res],
                  sel: BestFrameSelector, out: Path, chainage_origin: float, prog: _Progress):
@@ -430,6 +529,7 @@ class _Decode:
         self.t_png = 0.0
         if cfg.segments.export_segment_view:
             (out / "segment_views").mkdir()
+        self.gates = _InOrder(self._segment, GATE_QUEUE, "gate")
 
     def _infos(self, rows, res: tuple[int, int], rotate180: bool, black: list) -> dict[int, FrameInfo]:
         """FrameInfo of every frames.csv row of one video segment, by sample index (vectorised over rows)."""
@@ -466,11 +566,12 @@ class _Decode:
                 self.n_rgb += 1
             self.sel.offer(info, fr.rgb)
             for r in self.sel.pop_ready(info.c):
-                self._segment(r)
+                self.gates.submit(r)
 
     def finish(self) -> None:
         for r in self.sel.flush():
-            self._segment(r)
+            self.gates.submit(r)
+        self.gates.close()
         t = time.time()
         self.pool.close()  # every frame is on disk and hashed (frame.sha256 filled) before the outputs
         self.t_png = time.time() - t
@@ -520,7 +621,7 @@ class _Decode:
                          status=rec["status"], frames_decoded=self.n_decoded, **self.status_counts)
         # The result without its frame: report statistics only, the RGB is released here.
         self.results.append(SegmentResult(res.segment, res.window, res.best, None, res.n_candidates,
-                                          res.sharpness_rank, res.reason, res.excluded))
+                                          res.sharpness_rank, res.reason, res.excluded, res.choice, res.fair_rel))
 
 
 # ---- report ----------------------------------------------------------------------------------
@@ -589,7 +690,8 @@ def _report(s: Session, session_dir: Path, cfg: Config, traj: Trajectory, route:
                     "gsd_along_mm_segment_centre": _dist(gsd), "speed_mps": _dist(speeds),
                     "low_light_share_chosen": _share(low_chosen, len(cov)),
                     "low_light_share_frames": _share(dec.n_low_light, dec.n_decoded),
-                    "chosen_reasons": {k: sum(1 for x in q if x["reason"] == k) for k in sorted({x["reason"] for x in q})}},
+                    "chosen_reasons": {k: sum(1 for x in q if x["reason"] == k) for k in sorted({x["reason"] for x in q})},
+                    **_choice_summary(cfg, dec.results)},
         "frames": {"decoded": dec.n_decoded, "converted_rgb": dec.n_rgb, "written": n_sent},
         "estimated_vlm_hours": n_sent * SECONDS_PER_IMAGE / 3600,
         "vlm_estimate": {"seconds_per_image": SECONDS_PER_IMAGE, "images": n_sent,
@@ -598,7 +700,8 @@ def _report(s: Session, session_dir: Path, cfg: Config, traj: Trajectory, route:
                          "hours_if_all_covered_sent": len(cov) * SECONDS_PER_IMAGE / 3600},
         "trajectory": traj.to_dict(),
         "geometry": {f"{w}x{h}": {**r.geom.summary(L), "gate_view": r.view.summary()} for (w, h), r in rs.items()},
-        "bank": {f"{w}x{h}": {"frames": r.bank_frames, **r.gate.detector.bank.stats} for (w, h), r in rs.items()},
+        "bank": {f"{w}x{h}": {"frames": r.bank_frames, **(r.gate.detector.bank.stats if r.gate.needs_bank else {"built": False})}
+                 for (w, h), r in rs.items()},
         "probe": _probe_summary(next(iter(rs.values())).gate.detector.probe),
         "timings_s": dict(timings), "dinov2_calls": timed.calls, "features_device": str(features.device),
         "config": cfg.to_dict(),

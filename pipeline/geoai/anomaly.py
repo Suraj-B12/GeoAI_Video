@@ -547,15 +547,10 @@ class AnomalyDetector:
         """
         feats = self._features(rgb)
         _, z = self.bank.score(feats, s_m)
-        paint = None
-        if self.cfg.mask_paint:
-            paint = paint_fraction(rgb, self.gh, self.gw, self.cfg.paint_ratio) > self.cfg.paint_patch_frac
+        paint = self._paint(rgb)
+        if paint is not None:
             z = np.where(paint, 0.0, z)
-        logit = None
-        if self.probe is not None:
-            logit = self.probe.logits(feats)
-            if paint is not None:
-                logit = np.where(paint, PAINT_LOGIT, logit)
+        logit = self._probe_logits(feats, paint)
         probe_cands, pdiag = self._probe_candidates(logit)
         thr = self.cfg.score_threshold
         seeds = apply_hysteresis_threshold(z, self.cfg.grow_fraction * thr, thr)
@@ -594,6 +589,31 @@ class AnomalyDetector:
                 "paint": paint if paint is not None else np.zeros((self.gh, self.gw), bool),
                 "crack_mask": crack_mask, "components": {"dino": dino, "crack": crack, "probe": probe_cands},
                 "candidates": cands, "diag": diag}
+
+    def probe_maps(self, rgb: np.ndarray) -> dict:
+        """The probe's part of `maps` alone: no bank, no crack filter (the segment gate when only the probe
+        decides, docs/pipeline/13 §4). Needs no bank frames and no `finalize`.
+
+        Returns {"probe_logit": (gh, gw) logits or None without a probe, "paint": (gh, gw) bool}, computed
+        by the same functions as in `maps` (illumination normalisation, DINOv2, paint mask, probe), so
+        both are identical to those of `maps` for the same image. Without a probe DINOv2 isn't run.
+        """
+        paint = self._paint(rgb)
+        logit = None if self.probe is None else self._probe_logits(self._features(rgb), paint)
+        return {"probe_logit": logit, "paint": paint if paint is not None else np.zeros((self.gh, self.gw), bool)}
+
+    def _paint(self, rgb: np.ndarray) -> np.ndarray | None:
+        """Patches mostly covered by road paint, or None with mask_paint off."""
+        if not self.cfg.mask_paint:
+            return None
+        return paint_fraction(rgb, self.gh, self.gw, self.cfg.paint_ratio) > self.cfg.paint_patch_frac
+
+    def _probe_logits(self, feats: np.ndarray, paint: np.ndarray | None) -> np.ndarray | None:
+        """Probe logits, PAINT_LOGIT on paint patches; None without a probe."""
+        if self.probe is None:
+            return None
+        logit = self.probe.logits(feats)
+        return logit if paint is None else np.where(paint, PAINT_LOGIT, logit)
 
     def _probe_candidates(self, logit: np.ndarray | None) -> tuple[list[Candidate], dict]:
         """Regions the probe calls distress; evidence = sum of (logit - grow level) over the region.

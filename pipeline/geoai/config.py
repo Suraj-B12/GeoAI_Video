@@ -1,6 +1,8 @@
 """All tunable parameters, with defaults. Override with a JSON file (`--config my.json`).
 
-Unknown keys in an override are an error, so a typo can't silently leave a default in place.
+Unknown keys in an override are an error, so a typo can't silently leave a default in place. A
+relative file path in a JSON file (PATH_KEYS) is relative to that file's folder, so a committed
+override such as pipeline/calibration/segments_probe_gate.json works from any working directory.
 """
 from __future__ import annotations
 
@@ -11,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 PIPELINE_DIR = Path(__file__).resolve().parent.parent
+# Settings that name a file: (section, key).
+PATH_KEYS = (("anomaly", "weights"), ("anomaly", "probe"), ("gate", "calibration"))
 
 
 @dataclass
@@ -139,6 +143,18 @@ class VlmConfig:
         "Corrugation", "Shoving", "Shallow Depression", "Settlement", "Stripping", "Ravelling",
         "Potholes", "Edge Breaking", "Normal",
     )
+    # What a segment request shows (docs/pipeline/13 §6). frame: the whole best frame (evaluated regime).
+    # band: the segment's rows plus band_margin_frac of them above the far edge, full width, cut losslessly
+    # from the frame at export. A whole frame shows 1.4-23 m of road for a 5 m segment (the segment is ~57 %
+    # of its rows), and distress beyond the far edge was labelled on segments whose own rows are clean.
+    image: str = "frame"               # frame | band
+    # 10 %: the VLM sees where the segment ends (the road continues above it) without a neighbouring
+    # segment's worth of road: at the far edge (~6.4-7.4 m ahead) 10 % of the rows is ~1 m of road.
+    band_margin_frac: float = 0.10
+    # Widest input the VLM was evaluated on: Attain's 1479 x 508 road bands (403 of 847 frames), 1484 x 504
+    # after its resize = 2.94:1. A shorter band grows to this aspect, downwards first (near rows cover
+    # millimetres of road each, far rows centimetres), then upwards.
+    band_max_aspect: float = 2.94
 
 
 @dataclass
@@ -154,19 +170,45 @@ class SegmentConfig:
     skip_low_light: bool = False       # True: low-light frames never chosen (else only when nothing else)
     min_speed_mps: float = 0.5         # standing still: no segment progress, no candidates
     export_segment_view: bool = False  # also write a fixed native-resolution image of the segment rows (research)
+    # Which candidate is "best" (docs/pipeline/13 §3). sharpest: the highest Tenengrad of the segment's rows.
+    # That score is scale-biased: a farther frame shows the same road in fewer, denser rows, whose gradients
+    # are larger per pixel, so it chooses frames ~0.55 m further on average and the segment loses ~25 % of its
+    # rows (discriminator analysis 2026-10-28). nearest_sharp: the nearest candidate whose fair sharpness
+    # (the near fair_strip_m of the segment, rectified to a common fair_grid_mm ground grid, so every frame is
+    # compared at the same ground resolution) is at least fair_rel_min of the best such value in its tier.
+    choice: str = "sharpest"           # sharpest | nearest_sharp
+    # 0.9: on a rendered S21 road a Gaussian blur of sigma 1 px at full resolution (0.35 px at the VLM's
+    # input) lowers the fair score by 1-5 %, sigma 2 px by 8-21 %, sigma 3 px by 16-38 % (near / far end of
+    # the window); identical road quality scores within 1 % at every distance while the raw score grows 72 %.
+    # So a nearer frame is passed over only for blur of about 2 px or more, which the VLM's input keeps.
+    fair_rel_min: float = 0.9
+    # 4 mm: coarser than the full-resolution along-track pixel (0.8-3.4 mm) everywhere in the strip of every
+    # candidate (S21, 23 deg: near edge 1.39-2.39 m, strip end <= 3.39 m), so no frame is upsampled and the
+    # comparison does not depend on distance; it is also the VLM-input resolution at ~2 m (spec §1).
+    fair_grid_mm: float = 4.0
+    fair_strip_m: float = 1.0          # the segment's near metre: its finest rows, where blur matters most
+    fair_supersample: int = 4          # sample at grid / 4 (1 mm, at or below the native pitch), then area-average
+    fair_half_width_m: float = 1.5     # lane half width; capped by what the bottom row shows (S21: ~1.15 m)
 
 
 @dataclass
 class GateConfig:
     """Frame-level distress check on the segment area of the best frame (docs/pipeline/13 §4)."""
     mode: str = "gate"                 # gate: send segments that pass | all: send every segment (calibration)
-    # A segment passes when ANY signal reaches its threshold. Defaults are conservative starting points;
-    # `geoai gate-calibrate` sets them from VLM answers (label-free) and writes gate_calibration.json.
-    probe_frac: float = 0.05           # share of segment road patches the Attain probe calls distress
-    evidence: float = 30.0             # summed bank + crack evidence of anomalies inside the segment
-    crack_mm: float = 300.0            # total crack length inside the segment
+    # A segment passes when ANY signal reaches its threshold (None = that signal is off). Defaults are
+    # conservative starting points; `geoai gate-calibrate` sets them from VLM answers (label-free) and
+    # writes gate_calibration.json. With evidence and crack_mm both None the bank and the crack filter
+    # are not run (they feed only those two; against the VLM their AUROC was 0.51-0.57 within each of
+    # the S21 sessions d47c and f428, probe_frac's 0.73-0.80: gate analysis of 28 Oct 2026).
+    probe_frac: float | None = 0.05    # share of segment road patches the Attain probe calls distress
+    evidence: float | None = 30.0      # summed bank + crack evidence of anomalies inside the segment
+    crack_mm: float | None = 300.0     # total crack length inside the segment
     audit_frac: float = 0.10           # rejected segments also sent, to measure the gate's misses
-    calibration: str | None = None     # path to gate_calibration.json; its thresholds override the above
+    # Path to a gate calibration (gate_calibration.json); its thresholds replace the three above. A
+    # signal it turns off (null) is not computed: with evidence and crack_mm both off there is no bank
+    # and no crack filter, and those scores are recorded as null. The calibration in use for the S21
+    # mount: pipeline/calibration/segments_probe_gate.json (docs/pipeline/13 §4).
+    calibration: str | None = None
     # Analysis view (full width, far window edge to bottom row) at most this many pixels: S21 4K at 23 deg
     # would be 6.7 MP at the 2 mm/px target; capped, it scales by ~0.77 (DINOv2 + crack filter ~0.4 s/frame).
     max_analysis_px: int = 4_000_000
@@ -206,9 +248,17 @@ def _merge(obj: Any, override: dict, path: str) -> None:
 
 
 def load_config(path: Path | None = None, overrides: dict | None = None) -> Config:
+    """Defaults, then the JSON file `path` (relative PATH_KEYS resolved against its folder), then `overrides`
+    (paths as given)."""
     cfg = Config()
     if path is not None:
-        _merge(cfg, json.loads(Path(path).read_text(encoding="utf-8")), "")
+        path = Path(path)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        _merge(cfg, data, "")
+        for section, key in PATH_KEYS:
+            v = (data.get(section) or {}).get(key)
+            if v and not Path(v).is_absolute():
+                setattr(getattr(cfg, section), key, str((path.parent / v).resolve()))
     if overrides:
         _merge(cfg, overrides, "")
     return cfg

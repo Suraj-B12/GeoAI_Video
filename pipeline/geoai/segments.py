@@ -19,7 +19,10 @@ Which of them is best (§3). Every candidate is scored by the normalised Tenengr
 rows (lane columns only). Defocus, vibration and compression differ from frame to frame, and the
 sharpest frame is the one with the least of them. Motion smear cannot be chosen away (speed and
 shutter are the same in neighbouring frames): it is predicted from speed, exposure and the gyro,
-used as a filter, and recorded.
+used as a filter, and recorded. That raw score also grows with distance (the same road in fewer,
+denser rows), so `choice = nearest_sharp` instead takes the nearest candidate that is nearly as sharp
+as the best one on a common ground grid (`FairSharpness`): the finest view of the segment, unless
+it is visibly blurred.
 
 Streaming (one decode pass). Frames are offered in time order, so c never decreases; a segment is
 final once c has passed its window. Only the best RGB of each open segment is kept: with the default
@@ -60,6 +63,10 @@ _FOOTPRINT_STEP_PX = 8
 
 # Reason codes. A chosen frame's reason is indexed by its tier (2 x low_light + over_blur_limit).
 CHOSEN_REASONS = ("sharpest", "sharpest_over_blur_limit", "only_low_light", "only_low_light_over_blur_limit")
+# The same tiers under segments.choice = nearest_sharp (the low-light names are shared: they say why the
+# frame was used, not how it was picked; quality.choice says that).
+NEAREST_REASONS = ("nearest_sharp", "nearest_sharp_over_blur_limit", "only_low_light", "only_low_light_over_blur_limit")
+CHOICES = ("sharpest", "nearest_sharp")
 # Why a frame inside a window is not a candidate, in priority order (one reason per frame).
 EXCLUSION_REASONS = ("gnss_gap", "black", "reversing", "standing", "low_light")
 # Why a window saw no frame at all. no_frame_in_window: consecutive frames straddled the window
@@ -338,6 +345,8 @@ def sharpness(rgb: np.ndarray, rows: tuple[int, int], *, cols: tuple[float, floa
     borders add nothing. Dividing by the squared mean makes it independent of exposure and gain:
     I -> kI scales both by k². The column band keeps the lane and leaves out the roadside
     (vegetation, parked vehicles), whose texture would otherwise dominate. 0 for a black region.
+    Float, not 8-bit grey: 8-bit BT.601 grey is ~3x faster but chose another frame in 2 of the 813
+    segments of the S21 sessions of 26-27 Oct (gate/speed analysis of 28 Oct 2026), so it was not adopted.
     """
     c_lo, c_hi = cols
     if not 0.0 <= c_lo < c_hi <= 1.0:
@@ -364,6 +373,96 @@ def sharpness(rgb: np.ndarray, rows: tuple[int, int], *, cols: tuple[float, floa
     if mean_i <= 0.0:
         return 0.0
     return float(np.mean(gx * gx + gy * gy)) / (mean_i * mean_i)
+
+
+def _tenengrad(grey: np.ndarray) -> float:
+    """mean(Gx² + Gy²) / mean(I)² of a float32 grey image, 3x3 Sobel, border pixels excluded (as `sharpness`)."""
+    gx = cv2.Sobel(grey, cv2.CV_32F, 1, 0, ksize=3)[1:-1, 1:-1].astype(np.float64)
+    gy = cv2.Sobel(grey, cv2.CV_32F, 0, 1, ksize=3)[1:-1, 1:-1].astype(np.float64)
+    mean_i = float(grey[1:-1, 1:-1].mean(dtype=np.float64))
+    if mean_i <= 0.0:
+        return 0.0
+    return float(np.mean(gx * gx + gy * gy)) / (mean_i * mean_i)
+
+
+class FairSharpness:
+    """Sharpness of the same piece of road at the same ground resolution in every candidate frame.
+
+    The raw `sharpness` of the segment's rows depends on scale: a farther frame shows the road in fewer
+    rows, and its per-pixel gradients are larger for the same image quality. Here every candidate is
+    resampled onto one ground grid, so the score compares blur alone:
+    - the strip: the segment's first `fair_strip_m` (ground y in [d0, d0 + strip], d0 = s0 - c, the near
+      edge ahead of the camera), |x| <= half width;
+    - the grid: `fair_grid_mm` cells. The image is sampled bilinearly at grid / `fair_supersample` and each
+      cell is the mean of its supersample² samples (area averaging), so no frame aliases. The grid is
+      coarser than the full-resolution pixel everywhere in the strip of every candidate (S21: along-track
+      0.8-3.4 mm), so no frame is upsampled either;
+    - the score: the normalised Tenengrad of that grid image (`sharpness`'s formula), exposure-invariant.
+    The half width is capped by what the bottom row of the frame shows (the nearest candidate's strip
+    starts there), so every grid point lies inside the image in every candidate: no image border ever
+    enters the gradients (a constant border would add a strong edge that grows as the frame gets
+    nearer).
+
+    The sampling map is computed once per recording size, for strips starting anywhere in
+    [near_m, near_m + window_m]; a candidate's strip is the block of map rows starting at the grid row
+    nearest to d0 (within half a sample, 0.5 mm). Ground points are on the flat road, as everywhere in
+    segment mode.
+    """
+
+    def __init__(self, geom: SegmentGeometry, near_m: float, cfg: Config | SegmentConfig):
+        c = _seg_cfg(cfg)
+        k = int(c.fair_supersample)
+        if k < 1 or not c.fair_grid_mm > 0 or not c.fair_strip_m > 0 or not c.fair_half_width_m > 0:
+            raise ValueError("fair sharpness needs fair_supersample >= 1 and positive grid, strip and half width")
+        self.k = k
+        self.step_m = c.fair_grid_mm / 1000.0 / k
+        self.near_m = float(near_m)
+        self.n_strip = k * max(3, int(round(c.fair_strip_m / (c.fair_grid_mm / 1000.0))))
+        n_y = self.n_strip + int(math.ceil(c.window_m / self.step_m)) + 1
+        m = geom.model
+        # Half width: what both bottom corners of the usable image see (the narrowest view of the strip).
+        xb, _, okb = m.pixel_to_ground(np.array([0.0, m.width - 1.0]), np.array([float(geom.v_usable)] * 2))
+        if not okb.all():
+            raise ValueError("the bottom row's corners see no road")
+        hw = min(float(c.fair_half_width_m), float(-xb[0]), float(xb[1])) - c.fair_grid_mm / 1000.0
+        n_cells = int(math.floor(2 * hw / (c.fair_grid_mm / 1000.0)))
+        if n_cells < 3:
+            raise ValueError(f"fair sharpness strip too narrow ({2 * hw:.2f} m)")
+        n_x = n_cells * k
+        xs = (np.arange(n_x) - (n_x - 1) / 2.0) * self.step_m
+        ys = self.near_m + (np.arange(n_y) + 0.5) * self.step_m
+        X, Y = np.meshgrid(xs, ys)
+        u, v, ok = m.ground_to_pixel(X, Y)
+        inside = ok & (u >= 0) & (u <= m.width - 1) & (v >= 0) & (v <= geom.v_usable)
+        if not inside.all():
+            raise ValueError("fair sharpness strip leaves the image (camera roll?)")
+        # The block of the frame the map reads, so each call converts only that block to grey.
+        self.u0, self.v0 = int(math.floor(u.min())), int(math.floor(v.min()))
+        self.u1, self.v1 = min(m.width, int(math.ceil(u.max())) + 2), min(geom.v_usable + 1, int(math.ceil(v.max())) + 2)
+        self.map_u = (u - self.u0).astype(np.float32)
+        self.map_v = (v - self.v0).astype(np.float32)
+        self.half_width_m = n_cells * c.fair_grid_mm / 2000.0
+        self.size = (m.width, m.height)
+
+    def start_row(self, d0: float) -> int:
+        """First map row of the strip whose near edge is d0 metres ahead (clipped to the map)."""
+        i = int(round((float(d0) - self.near_m) / self.step_m))
+        return min(max(i, 0), self.map_u.shape[0] - self.n_strip)
+
+    def grid(self, rgb: np.ndarray, d0: float) -> np.ndarray:
+        """The strip on the common ground grid (float32 grey, far edge in row 0)."""
+        if rgb.shape[1] != self.size[0] or rgb.shape[0] != self.size[1]:
+            raise ValueError(f"fair sharpness for {self.size[0]}x{self.size[1]} frames, got {rgb.shape[1]}x{rgb.shape[0]}")
+        i0 = self.start_row(d0)
+        block = cv2.cvtColor(np.ascontiguousarray(rgb[self.v0:self.v1, self.u0:self.u1]), cv2.COLOR_RGB2GRAY)
+        fine = cv2.remap(block.astype(np.float32), self.map_u[i0:i0 + self.n_strip], self.map_v[i0:i0 + self.n_strip],
+                         cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        h, w = fine.shape
+        cells = fine.reshape(h // self.k, self.k, w // self.k, self.k).mean(axis=(1, 3), dtype=np.float64)
+        return cells[::-1].astype(np.float32)  # map rows run near -> far; image rows far -> near
+
+    def __call__(self, rgb: np.ndarray, d0: float) -> float:
+        return _tenengrad(self.grid(rgb, d0))
 
 
 def predicted_blur(speed_mps: float, exposure_ns, gsd_along_mm: float, omega_perp_rad_s: float,
@@ -482,6 +581,7 @@ class FrameScore:
     blur_px: float
     over_blur_limit: bool
     tier: int                        # 2 x low_light + over_blur_limit; lower is preferred
+    fair_sharpness: float = math.nan  # FairSharpness of the segment's near strip (choice nearest_sharp only)
 
     def key(self) -> tuple[int, float, float]:
         """Sort key, best first: tier, then sharpest, then nearest (largest c: the segment is closest).
@@ -498,17 +598,23 @@ class SegmentResult:
     rgb: np.ndarray | None           # the best frame, full resolution (None without one)
     n_candidates: int
     sharpness_rank: int | None       # 1 = the sharpest candidate; >1 when a sharper one was filtered
-    reason: str                      # CHOSEN_REASONS, EXCLUSION_REASONS or EMPTY_REASONS
+    reason: str                      # CHOSEN_REASONS / NEAREST_REASONS, EXCLUSION_REASONS or EMPTY_REASONS
     excluded: dict[str, int] = field(default_factory=dict)  # frames in the window that were not candidates
+    choice: str = "sharpest"         # SegmentConfig.choice that picked the frame
+    fair_rel: float | None = None    # nearest_sharp: the chosen frame's fair sharpness / the best in its tier
 
     @property
     def covered(self) -> bool:
         return self.best is not None
 
     def quality(self) -> dict:
-        """The record's `quality` section (schema geoai.segment.v1), JSON-ready (unknown -> None)."""
+        """The record's `quality` section (schema geoai.segment.v1), JSON-ready (unknown -> None).
+
+        With choice nearest_sharp it also has the optional fields `choice`, `fair_sharpness` and
+        `fair_sharpness_rel` (docs/pipeline/13 §5); with the default choice it is exactly the spec's eight.
+        """
         b = self.best
-        return {
+        q = {
             "sharpness": _json_num(b.sharpness) if b else None,
             "sharpness_rank": self.sharpness_rank,
             "n_candidates": self.n_candidates,
@@ -518,6 +624,10 @@ class SegmentResult:
             "gyro_rad_s": _json_num(_finite(b.info.omega_perp_rad_s)) if b else None,
             "reason": self.reason,
         }
+        if self.choice != "sharpest":
+            q.update({"choice": self.choice, "fair_sharpness": _json_num(b.fair_sharpness) if b else None,
+                      "fair_sharpness_rel": _json_num(self.fair_rel) if b and self.fair_rel is not None else None})
+        return q
 
 
 @dataclass
@@ -526,6 +636,11 @@ class _Open:
     rgb: np.ndarray | None = None
     sharp: list[float] = field(default_factory=list)
     excluded: dict[str, int] = field(default_factory=dict)
+    # nearest_sharp: the best tier seen, its highest fair sharpness, and the frames of that tier that can
+    # still be chosen, in arrival (= distance) order, each with a higher fair sharpness than every later one.
+    tier: int | None = None
+    fair_max: float = -math.inf
+    kept: list[tuple[FrameScore, np.ndarray]] = field(default_factory=list)
 
 
 class BestFrameSelector:
@@ -540,8 +655,10 @@ class BestFrameSelector:
     twice is an error) and positions must not decrease (path distance s is monotonic in time).
 
     Choice within a window: tier first (not low-light before low-light; within each, predicted blur
-    <= max_blur_px before above it), then the highest sharpness, then the nearest frame (largest c).
-    Low-light frames are excluded outright with skip_low_light. Frames in GNSS gaps, black
+    <= max_blur_px before above it), then, with choice `sharpest` (default), the highest sharpness, then
+    the nearest frame (largest c). With choice `nearest_sharp`, within the best tier present: the
+    nearest frame whose FairSharpness is >= fair_rel_min x the highest FairSharpness of that tier (ties
+    at one position: the frame offered last). Low-light frames are excluded outright with skip_low_light. Frames in GNSS gaps, black
     intervals, while reversing or below min_speed_mps (standing still: no progress along s) are never
     candidates; they are counted, and a window with only such frames is reported with the most
     frequent of those reasons.
@@ -549,7 +666,9 @@ class BestFrameSelector:
     Memory: per open segment the best frame's RGB (by reference: callers must not write into an
     offered array afterwards) and the candidates' sharpness values (for the rank). A segment is open
     from its first frame until c passes its window, so with window_m < length_m at most one frame is
-    held; with overlapping windows ceil(window_m / length_m) + 1.
+    held; with overlapping windows ceil(window_m / length_m) + 1. With nearest_sharp a segment keeps
+    the frames that can still be chosen: those within fair_rel_min of the best so far that no nearer
+    frame matches. That is usually one or two; at worst every candidate of the window.
 
     Several recording sizes (e.g. a thermal step-down from 4K to 1080p between video segments) are
     handled by passing one SegmentGeometry per size; each frame is measured with the geometry of its
@@ -560,11 +679,18 @@ class BestFrameSelector:
     def __init__(self, segments: Sequence[Segment], geoms: SegmentGeometry | Sequence[SegmentGeometry],
                  cfg: Config | SegmentConfig):
         self.cfg = _seg_cfg(cfg)
+        if self.cfg.choice not in CHOICES:
+            raise ValueError(f"segments.choice must be one of {CHOICES}, got {self.cfg.choice!r}")
+        if self.cfg.choice == "nearest_sharp" and not 0.0 < self.cfg.fair_rel_min <= 1.0:
+            raise ValueError(f"segments.fair_rel_min must be in (0, 1], got {self.cfg.fair_rel_min}")
         geom_list = [geoms] if isinstance(geoms, SegmentGeometry) else list(geoms)
         self.near_m, self.far_m = _view_range(geom_list)
         self._geoms: dict[tuple[int, int], SegmentGeometry] = {(g.width, g.height): g for g in geom_list}
         if len(self._geoms) != len(geom_list):
             raise ValueError("one SegmentGeometry per recording size")
+        self._fair: dict[tuple[int, int], FairSharpness] = {}
+        if self.cfg.choice == "nearest_sharp":
+            self._fair = {size: FairSharpness(g, self.near_m, self.cfg) for size, g in self._geoms.items()}
         self.segments = list(segments)
         if [s.k for s in self.segments] != list(range(len(self.segments))):
             raise ValueError("segments must be numbered 0..n-1 in order")
@@ -590,7 +716,9 @@ class BestFrameSelector:
     @property
     def held_frames(self) -> int:
         """Distinct RGB frames currently held (the memory the selector keeps alive)."""
-        return len({id(o.rgb) for o in self._open.values() if o.rgb is not None})
+        held = {id(o.rgb) for o in self._open.values() if o.rgb is not None}
+        held |= {id(rgb) for o in self._open.values() for _, rgb in o.kept}
+        return len(held)
 
     @property
     def n_emitted(self) -> int:
@@ -679,9 +807,31 @@ class BestFrameSelector:
             score = self._score(self.segments[k], info, c, geom, rgb)
             o = self._open.setdefault(k, _Open())
             o.sharp.append(score.sharpness)
-            if o.best is None or score.key() < o.best.key():
+            if self._fair:
+                self._keep_nearest_sharp(o, score, rgb)
+            elif o.best is None or score.key() < o.best.key():
                 o.best, o.rgb = score, rgb
         return len(ks)
+
+    def _keep_nearest_sharp(self, o: _Open, score: FrameScore, rgb: np.ndarray) -> None:
+        """nearest_sharp bookkeeping for one candidate (frames arrive far to near).
+
+        A frame of a worse tier than the best seen is never chosen; a better tier starts afresh. Within the
+        tier, a kept frame is dropped when a nearer frame is at least as sharp (whenever the farther one
+        qualifies, so does the nearer one) or when it falls below fair_rel_min x the tier's best, which only
+        grows. The last kept frame is therefore the nearest one that qualifies so far.
+        """
+        if o.tier is not None and score.tier > o.tier:
+            return
+        if o.tier is None or score.tier < o.tier:
+            o.tier, o.fair_max, o.kept = score.tier, -math.inf, []
+        score.fair_sharpness = self._fair[(score.width, score.height)](rgb, score.near_edge_ahead_m)
+        o.fair_max = max(o.fair_max, score.fair_sharpness)
+        bar = self.cfg.fair_rel_min * o.fair_max
+        o.kept = [(s, im) for s, im in o.kept if s.fair_sharpness > score.fair_sharpness and s.fair_sharpness >= bar]
+        if score.fair_sharpness >= bar:
+            o.kept.append((score, rgb))
+        o.best, o.rgb = o.kept[-1]
 
     def _score(self, seg: Segment, info: FrameInfo, c: float, geom: SegmentGeometry, rgb: np.ndarray) -> FrameScore:
         cfg = self.cfg
@@ -721,6 +871,10 @@ class BestFrameSelector:
         o = self._open.pop(k, None)
         if o is not None and o.best is not None:
             rank = 1 + sum(1 for s in o.sharp if s > o.best.sharpness)
+            if self._fair:
+                rel = o.best.fair_sharpness / o.fair_max if o.fair_max > 0 else 1.0
+                return SegmentResult(seg, window, o.best, o.rgb, len(o.sharp), rank, NEAREST_REASONS[o.best.tier],
+                                     dict(sorted(o.excluded.items())), self.cfg.choice, rel)
             return SegmentResult(seg, window, o.best, o.rgb, len(o.sharp), rank, CHOSEN_REASONS[o.best.tier],
                                  dict(sorted(o.excluded.items())))
         excluded = dict(sorted(o.excluded.items())) if o is not None else {}
@@ -735,4 +889,4 @@ class BestFrameSelector:
             reason = "after_recording"
         else:
             reason = "no_frame_in_window"
-        return SegmentResult(seg, window, None, None, 0, None, reason, excluded)
+        return SegmentResult(seg, window, None, None, 0, None, reason, excluded, self.cfg.choice)
