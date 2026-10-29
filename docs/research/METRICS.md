@@ -108,11 +108,35 @@ The reference is the VLM (Qwen2.5-VL-7B, zero-shot, IRC:82-2015 prompts, 4-bit, 
 
 Found by an adversarial review of the code and the data above. Each fix was measured before and after on the same data.
 
-*(Filled in as the measurements finish: VLM time per frame, held-out gate calibration and extraction time, best-frame choice and the VLM's view of the segment.)*
+Data and scripts: Capstone repo `eval_results/video_fixes/` (`STATUS.md` lists what is unfinished).
+
+| Change | Result | Adopted |
+|---|---|---|
+| `--profile video` (VLM skips record-only probe tiles) | Normal 13.72 → 3.76 s, Distress 24.41 → 14.43 s per frame; 60/60 answers identical; runner 14.4 → 5.2 s/image | **Yes** |
+| Sharpness on uint8 luma | ~2.9× faster per call; same frame on 811/813 segments | Safe, not yet on |
+| Probe-only gate | held out by drive: recall 87.8 % [78.5, 95.2] at 59.4 % pass (target 90 %) | No |
+| `vlm.image=band` | 84.1 % agreement with whole frames (κ 0.68); flips split band 21 / frame 17 / unclear 14 | No (`image=frame`) |
+| `segments.choice=nearest_sharp` | re-extracted, not yet analysed | Pending |
+
+## 9b. The survey at scale (29 Oct): 22 drives through the toggle
+
+The VLM PC processed 22 drives recorded on 27 Oct with no manual steps, gated with the default thresholds
+(details and per-drive table: Capstone `eval_results/video_survey.md`; figures `fig_v10`–`fig_v13`).
+
+- **Route:** 16.32 km, 3,266 segments; gate sent 2,989, audited 29, skipped 231; 17 not covered.
+- **VLM:** 3,018 answers, no errors; median 3.78 s per image (Normal 3.77, Distress 12.92) with `--profile video`.
+- **Distress:** 16.7 % of answered segments [15.4, 18.1] (first three drives, send-all: 20.2 %). Audited skips:
+  3/29 distressed (10.3 % [3.6, 26.4]). Per drive 1.3–44.3 %.
+- **Labels (share of answered length):** potholes 10.7 %, longitudinal cracking 7.7 %, bleeding 6.1 %, transverse
+  cracking 2.4 %, streaking 1.7 %, edge breaking 1.6 %, hungry surface 1.5 %, alligator cracking 1.4 %.
+- **Time:** 5.61 h wall for everything = 20.6 min per km (extraction ~3.5 min/km).
+- **Stored:** all 22 verified; 3,266 rows; 17.9 GB of lossless frames.
+- **Defect found at scale:** the VLM system's summary step expected `flags` as a dict (the contract says a list);
+  fixed in Capstone `e03e2a2`.
 
 ## 10. Limits that apply to every number here
 
 - **Reference:** the VLM is the reference, not engineers. Recall and precision of the gate are measured against its answers, including its mistakes.
-- **Sample size:** three drives (4.06 km) on two test roads on two days. Per-drive differences mix road, light, speed and focus.
+- **Sample size:** 25 drives (20.4 km) on two days with one phone; the first three send-all, the other 22 gated. Per-drive differences mix road, light, speed and focus.
 - **Positions:** phone GNSS, ±6 m (1σ). No latency correction and no map-matching. Chainage is null because no start chainage was entered on the survey form; use `s0_m` (path metres) instead.
 - **Resolution:** after the VLM's resize, hairline cracks beyond about 2 m ahead are not visible.
