@@ -134,23 +134,44 @@ The VLM PC processed 22 drives recorded on 27 Oct with no manual steps, gated wi
 - **Defect found at scale:** the VLM system's summary step expected `flags` as a dict (the contract says a list);
   fixed in Capstone `e03e2a2`.
 
+## 9b-2. All drives of 27 and 29 Oct (final, 30 Oct evening)
+
+40 drives stored and verified by the toggle (2 of 29 Oct refused: phone mounted in portrait). Capstone
+`eval_results/video_survey.md`.
+
+| | 40 drives | 27 Oct (22) | 29 Oct (18) |
+|---|---|---|---|
+| Route | 37.92 km, 7,589 segments | 16.32 km | 21.61 km |
+| Gate skipped | 16.6 % | 7.1 % | 23.8 % |
+| Distress, share of answered segments | 18.0 % [17.1, 19.0] | 16.7 % | 19.2 % |
+| Audited skips distressed | 13/161 = 8.1 % | 3/29 | 10/132 |
+| Expert review | 47.5 % | 52.0 % | 43.3 % |
+| Wall time | 12.27 h = 19.4 min/km | 20.6 min/km | 18.5 min/km |
+| Stored | 7,589 rows, 39.5 GB of frames | | |
+
+Defect found at scale and fixed here (`9043515`): a false reversing flip while standing before moving off
+marked drive 8130 (2.4 km) as 99.8 % reversing, so it had no usable bank frames. Reversing legs must now be
+<= 90 s and <= 5 m/s (90th percentile); on all 48 sessions only 8130 changed, and it then processed normally.
+
 ## 9c. Reliability and validity checks (30 Oct)
 
-Capstone `eval_results/video_evals.md` (`scripts/video_survey_evals.py`, no inference), on 34 stored drives
-(4,640 answers):
+Capstone `eval_results/video_evals.md` (`scripts/video_survey_evals.py`, no inference), on all 43 stored
+drives (7,050 answers):
 
-- **Repeatability:** not measurable yet. 62 revisit pairs from 4 drive pairs, only 5 with any distress;
-  agreement equals chance. Needs planned repeat drives of the same roads.
-- **Speed:** distress share falls with speed (31.2 % below 3 m/s, 6.5 % above 9 m/s) and stays lower on
-  faster-than-median segments **within** a drive (11.7 % vs 20.8 %). Fix a target speed in the survey protocol.
-- **Review load 49.1 %:** Stage 1 confidence < 0.80 56 %, Stage 1 safety net 23 %, both stages 16 %, Stage 2 5 %.
-- **Time inbox → map:** 6.11 s per segment = 4.7 s per segment + 10.3 s per distress answer (R² 0.997);
-  model 81 %, extraction 16 %, everything else 3 %.
+- **Repeatability:** first signal only. 77 revisit pairs within 5 m from 6 drive pairs (all same day):
+  agreement 89.6 % vs 71.9 % by chance, kappa 0.63, but the interval over drive pairs is [-0.19, 0.88].
+  Needs planned repeat drives of the same roads, both directions, different days.
+- **Speed:** distress share falls with speed (33.0 % below 3 m/s, 14-15 % above 6 m/s) and stays lower on
+  faster-than-median segments **within** a drive (13.7 % vs 22.9 %, 40 drives). Fix a target speed in the
+  survey protocol.
+- **Review load 47.6 %:** Stage 1 confidence < 0.80 54 %, Stage 1 safety net 27 %, both stages 13 %, Stage 2 6 %.
+- **Time inbox → map:** 5.86 s per segment = 62 s per drive + 3.8 s per segment + 11.1 s per distress answer
+  (R² 0.995, 38 drives); model 82 %, extraction 15 %, everything else 3 %.
 - **Tests:** this repo 250 passed, 12 GPU-only skipped (CPU run while the VLM classified).
 
 ## 10. Limits that apply to every number here
 
 - **Reference:** the VLM is the reference, not engineers. Recall and precision of the gate are measured against its answers, including its mistakes.
-- **Sample size:** 25 drives (20.4 km) on two days with one phone, plus 20 drives of 29 Oct being processed; the first three send-all, the rest gated. Speed varies within and between drives (§9c). Per-drive differences mix road, light, speed and focus.
+- **Sample size:** 25 drives (20.4 km) on two days with one phone, plus 18 drives of 29 Oct (43 drives, 42.0 km); the first three send-all, the rest gated. Speed varies within and between drives (§9c). Per-drive differences mix road, light, speed and focus.
 - **Positions:** phone GNSS, ±6 m (1σ). No latency correction and no map-matching. Chainage is null because no start chainage was entered on the survey form; use `s0_m` (path metres) instead.
 - **Resolution:** after the VLM's resize, hairline cracks beyond about 2 m ahead are not visible.
