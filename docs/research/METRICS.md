@@ -134,9 +134,23 @@ The VLM PC processed 22 drives recorded on 27 Oct with no manual steps, gated wi
 - **Defect found at scale:** the VLM system's summary step expected `flags` as a dict (the contract says a list);
   fixed in Capstone `e03e2a2`.
 
+## 9c. Reliability and validity checks (30 Oct)
+
+Capstone `eval_results/video_evals.md` (`scripts/video_survey_evals.py`, no inference), on 34 stored drives
+(4,640 answers):
+
+- **Repeatability:** not measurable yet. 62 revisit pairs from 4 drive pairs, only 5 with any distress;
+  agreement equals chance. Needs planned repeat drives of the same roads.
+- **Speed:** distress share falls with speed (31.2 % below 3 m/s, 6.5 % above 9 m/s) and stays lower on
+  faster-than-median segments **within** a drive (11.7 % vs 20.8 %). Fix a target speed in the survey protocol.
+- **Review load 49.1 %:** Stage 1 confidence < 0.80 56 %, Stage 1 safety net 23 %, both stages 16 %, Stage 2 5 %.
+- **Time inbox → map:** 6.11 s per segment = 4.7 s per segment + 10.3 s per distress answer (R² 0.997);
+  model 81 %, extraction 16 %, everything else 3 %.
+- **Tests:** this repo 250 passed, 12 GPU-only skipped (CPU run while the VLM classified).
+
 ## 10. Limits that apply to every number here
 
 - **Reference:** the VLM is the reference, not engineers. Recall and precision of the gate are measured against its answers, including its mistakes.
-- **Sample size:** 25 drives (20.4 km) on two days with one phone; the first three send-all, the other 22 gated. Per-drive differences mix road, light, speed and focus.
+- **Sample size:** 25 drives (20.4 km) on two days with one phone, plus 20 drives of 29 Oct being processed; the first three send-all, the rest gated. Speed varies within and between drives (§9c). Per-drive differences mix road, light, speed and focus.
 - **Positions:** phone GNSS, ±6 m (1σ). No latency correction and no map-matching. Chainage is null because no start chainage was entered on the survey form; use `s0_m` (path metres) instead.
 - **Resolution:** after the VLM's resize, hairline cracks beyond about 2 m ahead are not visible.
