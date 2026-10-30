@@ -392,42 +392,78 @@ def build_trajectory(fixes: CleanFixes, imu: pd.DataFrame | None, t0_ns: int, cf
         gyro_heading = np.concatenate([[0.0], np.cumsum(0.5 * (np.interp(grid[1:], *yr) + np.interp(grid[:-1], *yr)) / GRID_HZ)])
     else:
         gyro_heading = None
-    heading = heading_vel.copy()
-    from_gyro = np.zeros(len(grid), bool)
-    reversing = np.zeros(len(grid), bool)
-    state_rev = False
-    flips: list[int] = []
-    i = 0
     N = len(grid)
-    while i < N:
-        if not slow[i]:
+
+    def heading_pass(accept: set[int] | None):
+        """Heading and reversing state. A flip candidate is a low-speed interval across which the
+        velocity heading turned by > reversing_flip_deg more than the gyro did (the car stopped and
+        moved off the other way). Candidates do not depend on the state, so `accept` can veto some:
+        None accepts every candidate."""
+        heading = heading_vel.copy()
+        from_gyro = np.zeros(N, bool)
+        reversing = np.zeros(N, bool)
+        state_rev = False
+        flips: list[int] = []
+        candidates: list[int] = []
+        i = 0
+        while i < N:
+            if not slow[i]:
+                if state_rev:
+                    reversing[i] = True
+                    heading[i] = (heading_vel[i] + 180.0) % 360.0
+                i += 1
+                continue
+            j = i
+            while j < N and slow[j]:
+                j += 1
+            # Low-speed interval [i, j)
+            before = i - 1
+            after = j if j < N else None
+            base = heading[before] if before >= 0 else heading_vel[i]
+            for k in range(i, j):
+                if gyro_heading is not None and before >= 0:
+                    heading[k] = (base + gyro_heading[k] - gyro_heading[before]) % 360.0
+                else:
+                    heading[k] = base
+                from_gyro[k] = True
+            if after is not None and before >= 0 and gyro_heading is not None:
+                d_vel = wrap180(heading_vel[after] - heading_vel[before])
+                d_gyro = gyro_heading[after] - gyro_heading[before]
+                if abs(wrap180(d_vel - d_gyro)) > cfg.reversing_flip_deg:
+                    candidates.append(after)
+                    if accept is None or after in accept:
+                        state_rev = not state_rev
+                        flips.append(after)
             if state_rev:
-                reversing[i] = True
-                heading[i] = (heading_vel[i] + 180.0) % 360.0
-            i += 1
+                reversing[i:j] = True
+            i = j
+        return heading, from_gyro, reversing, flips, candidates
+
+    # A flip into reverse is accepted only if the leg it starts is plausible for reversing: short and
+    # slow. Without this, one spurious flip (velocity heading is noise while standing, e.g. before the
+    # car moves off) marks the rest of the drive as reversing, and every frame of it is rejected.
+    *_, candidates = heading_pass(set())
+    accepted: set[int] = set()
+    rejected = 0
+    state = False
+    for idx, c in enumerate(candidates):
+        if state:                       # flip back to forward: always accepted
+            accepted.add(c)
+            state = False
             continue
-        j = i
-        while j < N and slow[j]:
-            j += 1
-        # Low-speed interval [i, j)
-        before = i - 1
-        after = j if j < N else None
-        base = heading[before] if before >= 0 else heading_vel[i]
-        for k in range(i, j):
-            if gyro_heading is not None and before >= 0:
-                heading[k] = (base + gyro_heading[k] - gyro_heading[before]) % 360.0
-            else:
-                heading[k] = base
-            from_gyro[k] = True
-        if after is not None and before >= 0 and gyro_heading is not None:
-            d_vel = wrap180(heading_vel[after] - heading_vel[before])
-            d_gyro = gyro_heading[after] - gyro_heading[before]
-            if abs(wrap180(d_vel - d_gyro)) > cfg.reversing_flip_deg:
-                state_rev = not state_rev
-                flips.append(after)
-        if state_rev:
-            reversing[i:j] = True
-        i = j
+        end = candidates[idx + 1] if idx + 1 < len(candidates) else N
+        leg = speed[c:end]
+        too_long = (end - c) / GRID_HZ > cfg.reversing_max_s
+        too_fast = leg.size > 0 and float(np.percentile(leg, 90)) > cfg.reversing_max_speed_mps
+        if too_long or too_fast:
+            rejected += 1
+            continue
+        accepted.add(c)
+        state = True
+    if rejected:
+        log.info("trajectory: %d implausible reversing leg(s) ignored (longer than %.0f s or faster than %.1f m/s)",
+                 rejected, cfg.reversing_max_s, cfg.reversing_max_speed_mps)
+    heading, from_gyro, reversing, flips, _ = heading_pass(accepted)
     # The low-speed interval that ends a reversing leg belongs to it as well.
     for k in range(1, len(flips), 2):
         a = flips[k - 1]

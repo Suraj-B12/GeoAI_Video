@@ -141,6 +141,42 @@ def _three_point_turn():
     return df, imu
 
 
+def _false_flip_at_start(duration=200.0):
+    """Car stands, GNSS velocity heading is noise (points south), then drives north at 8 m/s for minutes.
+    Velocity heading turns 180 deg across the stop while the gyro sees no turn: a reversing flip candidate,
+    as in session 20261029T101817Z_8130, where it marked the whole 2.4 km drive as reversing."""
+    fs = 200.0
+    t = np.arange(0.0, duration, 1 / fs)
+    v = np.where(t < 2.0, 1.0, 0.0)              # creeping "south" in GNSS noise, then standing
+    v = np.where(t >= 6.0, 8.0, v)
+    pos = np.cumsum(np.where(t < 2.0, -v, v)) / fs
+    tau = np.arange(0.0, duration - 1, 1.0)
+    n = np.interp(tau, t, pos)
+    sv = np.interp(tau, t, v)
+    bearing = np.where(tau < 2.0, 180.0, 0.0)
+    df = fixes_frame(tau, 0 * n, n, sv, bearing)
+    up = np.array([0.0, 0.0, 9.81])
+    grav = np.tile(up, (t.size, 1))
+    imu = imu_frame(t, grav.copy(), grav, np.zeros((t.size, 3)))
+    return df, imu
+
+
+def test_fast_long_leg_after_a_stop_is_not_reversing():
+    df, imu = _false_flip_at_start()
+    cfg = GnssConfig()
+    traj = build_trajectory(clean_fixes(df, T0_NS, cfg), imu, T0_NS, cfg)
+    s = traj.sample(np.array([30.0, 100.0, 180.0]))
+    assert not s["reversing"].any(), "an 8 m/s, 3-minute leg must not be taken for reversing"
+    assert abs(wrap180(s["heading"][1])) < 5.0
+
+
+def test_reversing_plausibility_limits_are_configurable():
+    df, imu = _three_point_turn()                 # genuine reverse: 2.5 m/s for ~10 s
+    traj = build_trajectory(clean_fixes(df, T0_NS, GnssConfig()), imu, T0_NS,
+                            GnssConfig(reversing_max_speed_mps=2.0))
+    assert not traj.sample(np.array([30.0]))["reversing"][0]   # faster than allowed: ignored
+
+
 def test_reversing_leg_is_flagged():
     df, imu = _three_point_turn()
     cfg = GnssConfig()

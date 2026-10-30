@@ -32,6 +32,9 @@ class GnssConfig:
     latency_max_disagreement_s: float = 0.1
     min_speed_for_heading_mps: float = 1.5
     reversing_flip_deg: float = 120.0
+    # A detected reversing leg must look like reversing: else the flip that started it is ignored.
+    reversing_max_speed_mps: float = 5.0   # 90th-percentile speed of the leg (18 km/h)
+    reversing_max_s: float = 90.0
 
 
 @dataclass
