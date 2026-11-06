@@ -2,6 +2,21 @@
 
 Updated as work lands. If a session ends mid-task, a new session can continue from here.
 
+## State on 6 Nov 2026
+
+- **nearest_sharp fixed:** `segments.choice=nearest_sharp` failed on every real drive ("fair sharpness strip leaves the image"):
+  - **Cause:** the S21 mounts are rolled 1.2–4.4°, so the bottom row is slanted on the road, while `near_m` is the centre column.
+  - **Fix:** `FairSharpness` now starts the strip `offset_m` into the segment when needed, the same for every candidate. The offsets are f428 0.078, 293d 0.111 and d47c 0.034 m; a level camera keeps 0. The offsets are logged and stored in report.json `quality.fair.strip_offset_m`.
+  - **Tests:** `test_fair_sharpness_with_camera_roll` and `test_fair_sharpness_offset_is_zero_without_roll`.
+  - **Previous claim was wrong:** the 28 Oct note "re-extraction is in field/runs_eval/nearest" was not true; the folder was empty.
+- **Extraction timing (GPU runs of 28 Oct, analysed 6 Nov):**
+  - **Default config with the gate thread:** 937 → 722 s for 4.06 km (231 → 178 s/km), byte-identical outputs.
+  - **Probe-only gate:** 88 s/km.
+  - **Decision:** defaults kept, because the probe-only gate's held-out recall is 87.8 % < 90 %.
+- **Luma sharpness:** not adopted. The pre-registered rule needed all frames identical; 2/813 differ.
+- **Tests:** CPU suite 256 passed, 12 skipped (GPU-only).
+- **Pending:** the nearest_sharp A/B on d47c (VLM answers on the segments whose frame changes). Resume notes: Capstone `eval_results/video_fixes/STATUS.md`.
+
 ## State on 28 Oct 2026, evening (stopped by the usage limit)
 
 - Done and pushed: batch_001 classified (813/813) and stored; research record `docs/research/METRICS.md`;

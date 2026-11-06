@@ -392,7 +392,7 @@ class FairSharpness:
     rows, and its per-pixel gradients are larger for the same image quality. Here every candidate is
     resampled onto one ground grid, so the score compares blur alone:
     - the strip: the segment's first `fair_strip_m` (ground y in [d0, d0 + strip], d0 = s0 - c, the near
-      edge ahead of the camera), |x| <= half width;
+      edge ahead of the camera; [d0 + offset_m, ...] for a rolled camera, see below), |x| <= half width;
     - the grid: `fair_grid_mm` cells. The image is sampled bilinearly at grid / `fair_supersample` and each
       cell is the mean of its supersample² samples (area averaging), so no frame aliases. The grid is
       coarser than the full-resolution pixel everywhere in the strip of every candidate (S21: along-track
@@ -401,7 +401,10 @@ class FairSharpness:
     The half width is capped by what the bottom row of the frame shows (the nearest candidate's strip
     starts there), so every grid point lies inside the image in every candidate: no image border ever
     enters the gradients (a constant border would add a strong edge that grows as the frame gets
-    nearer).
+    nearer). With a rolled camera the bottom row is slanted on the road and part of the strip of the
+    nearest candidate would lie below the image; then the strip starts `offset_m` into the segment (the
+    farthest point the bottom row sees within the half width, rounded up to a sample), the same for every
+    candidate, so the comparison stays fair. offset_m is 0 whenever the strip fits unshifted.
 
     The sampling map is computed once per recording size, for strips starting anywhere in
     [near_m, near_m + window_m]; a candidate's strip is the block of map rows starting at the grid row
@@ -430,12 +433,32 @@ class FairSharpness:
             raise ValueError(f"fair sharpness strip too narrow ({2 * hw:.2f} m)")
         n_x = n_cells * k
         xs = (np.arange(n_x) - (n_x - 1) / 2.0) * self.step_m
-        ys = self.near_m + (np.arange(n_y) + 0.5) * self.step_m
-        X, Y = np.meshgrid(xs, ys)
-        u, v, ok = m.ground_to_pixel(X, Y)
-        inside = ok & (u >= 0) & (u <= m.width - 1) & (v >= 0) & (v <= geom.v_usable)
+
+        def project(offset_m: float):
+            Y_ = self.near_m + offset_m + (np.arange(n_y) + 0.5) * self.step_m
+            X_, Y_ = np.meshgrid(xs, Y_)
+            u_, v_, ok_ = m.ground_to_pixel(X_, Y_)
+            return u_, v_, ok_ & (u_ >= 0) & (u_ <= m.width - 1) & (v_ >= 0) & (v_ <= geom.v_usable)
+
+        # offset_m: how far into the segment the strip starts. 0 whenever the strip fits (as before 6 Nov 2026).
+        # A rolled camera (S21 mounts: 1-4 deg) slants the bottom row on the road: near_m is measured at the
+        # centre column, but one side of the bottom row sees up to ~0.1 m farther, so the nearest candidate's
+        # strip started below the image there and every real drive failed. Then the strip starts, for EVERY
+        # candidate, as far into the segment as the bottom row reaches within |x| <= half width (rounded up to a
+        # sample): the same piece of road is still compared in every frame, only 0.03-0.11 m later.
+        self.offset_m = 0.0
+        u, v, inside = project(0.0)
         if not inside.all():
-            raise ValueError("fair sharpness strip leaves the image (camera roll?)")
+            ub = np.arange(0.0, float(m.width), 1.0)
+            xr, yr, okr = m.pixel_to_ground(ub, np.full_like(ub, float(geom.v_usable)))
+            sel = okr & (np.abs(xr) <= n_x * self.step_m / 2.0 + self.step_m)
+            if sel.any():
+                extra = max(0.0, float(yr[sel].max()) - self.near_m)
+                self.offset_m = math.ceil(extra / self.step_m + 1.0) * self.step_m
+                u, v, inside = project(self.offset_m)
+            if not inside.all():
+                raise ValueError(f"fair sharpness strip leaves the image (offset {self.offset_m:.3f} m; roll "
+                                 f"{m.roll_deg:.1f} deg)")
         # The block of the frame the map reads, so each call converts only that block to grey.
         self.u0, self.v0 = int(math.floor(u.min())), int(math.floor(v.min()))
         self.u1, self.v1 = min(m.width, int(math.ceil(u.max())) + 2), min(geom.v_usable + 1, int(math.ceil(v.max())) + 2)
@@ -708,6 +731,12 @@ class BestFrameSelector:
         self._flushed = False
 
     # ---- queries -------------------------------------------------------------------------------
+    @property
+    def fair_offsets_m(self) -> dict[str, float]:
+        """nearest_sharp only: per recording size, how far into the segment the fair strip starts
+        (FairSharpness.offset_m; 0 unless camera roll slants the bottom row). Empty for `sharpest`."""
+        return {f"{w}x{h}": f.offset_m for (w, h), f in self._fair.items()}
+
     @property
     def n_open(self) -> int:
         """Segments that have seen a frame and are not emitted yet."""

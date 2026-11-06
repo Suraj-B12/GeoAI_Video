@@ -209,17 +209,19 @@ def _share(k: int, n: int) -> float | None:
     return k / n if n else None
 
 
-def _choice_summary(cfg: Config, results: list[SegmentResult]) -> dict:
+def _choice_summary(cfg: Config, results: list[SegmentResult], fair_offsets_m: dict | None = None) -> dict:
     """report.json quality fields of segments.choice = nearest_sharp (nothing for the default choice, so a
     default report is unchanged): the rule's settings, how far ahead the chosen frames saw the segment, and
-    their fair sharpness relative to the best of their tier."""
+    their fair sharpness relative to the best of their tier. strip_offset_m: per recording size, how far
+    into the segment the fair strip starts (0 unless camera roll slants the bottom row; segments.FairSharpness)."""
     sc = cfg.segments
     if sc.choice == "sharpest":
         return {}
     chosen = [r for r in results if r.best is not None]
     return {"choice": sc.choice,
             "fair": {"rel_min": sc.fair_rel_min, "grid_mm": sc.fair_grid_mm, "strip_m": sc.fair_strip_m,
-                     "supersample": sc.fair_supersample, "half_width_m": sc.fair_half_width_m},
+                     "supersample": sc.fair_supersample, "half_width_m": sc.fair_half_width_m,
+                     "strip_offset_m": dict(fair_offsets_m or {})},
             "near_edge_ahead_m": _dist(r.best.near_edge_ahead_m for r in chosen),
             "fair_sharpness_rel": _dist(r.fair_rel for r in chosen),
             "chosen_is_raw_sharpest_share": _share(sum(1 for r in chosen if r.sharpness_rank == 1), len(chosen))}
@@ -325,6 +327,10 @@ def _process(session_dir: Path, out_root: Path, cfg: Config, allow_test: bool, a
         chainage_origin = float(traj.sample(np.array([t_span[0]]))["s"][0])
         log.info("plan: %d segments of %.1f m from s = %.1f m (offset %.2f m), windows %.2f m",
                  len(segments), cfg.segments.length_m, segments[0].s0, offset, cfg.segments.window_m)
+        if any(sel.fair_offsets_m.values()):
+            log.info("nearest_sharp: fair strip starts %s m into each segment (camera roll %.1f deg)",
+                     {k: round(v, 3) for k, v in sel.fair_offsets_m.items()},
+                     next(iter(geoms.values())).model.roll_deg)
         st.update(segments=len(segments), near_m=sel.near_m, far_m=sel.far_m, offset_m=offset,
                   sizes=[f"{w}x{h}" for w, h in rs])
     prog = _Progress()
@@ -691,7 +697,7 @@ def _report(s: Session, session_dir: Path, cfg: Config, traj: Trajectory, route:
                     "low_light_share_chosen": _share(low_chosen, len(cov)),
                     "low_light_share_frames": _share(dec.n_low_light, dec.n_decoded),
                     "chosen_reasons": {k: sum(1 for x in q if x["reason"] == k) for k in sorted({x["reason"] for x in q})},
-                    **_choice_summary(cfg, dec.results)},
+                    **_choice_summary(cfg, dec.results, sel.fair_offsets_m)},
         "frames": {"decoded": dec.n_decoded, "converted_rgb": dec.n_rgb, "written": n_sent},
         "estimated_vlm_hours": n_sent * SECONDS_PER_IMAGE / 3600,
         "vlm_estimate": {"seconds_per_image": SECONDS_PER_IMAGE, "images": n_sent,

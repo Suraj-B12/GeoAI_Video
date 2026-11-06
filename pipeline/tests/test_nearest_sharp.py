@@ -115,6 +115,52 @@ def test_fair_sharpness_blur_and_exposure_at_quarter_size():
         FairSharpness(g, g.near_m, SegmentConfig(fair_supersample=0))
 
 
+@pytest.mark.parametrize("roll", [-4.06, -1.11, 2.7])
+def test_fair_sharpness_with_camera_roll(roll):
+    """S21 mounts are rolled (the 26-27 Oct drives: -2.69, -4.06, -1.11 deg). The bottom row is then slanted on
+    the road, so the strip of the nearest candidate started below the image on one side and nearest_sharp
+    failed on every real drive (found 6 Nov 2026). Now the strip starts offset_m into the segment for every
+    candidate: all samples inside the image, the same road compared in every frame, scale still removed."""
+    m = _cam(scale=0.25, roll=roll)
+    g = SegmentGeometry.build(m, Config())
+    sc = SegmentConfig(fair_grid_mm=16.0)
+    fs = FairSharpness(g, g.near_m, sc)
+    assert 0.0 < fs.offset_m < 0.2
+    u, v = fs.u0 + fs.map_u, fs.v0 + fs.map_v
+    assert u.min() >= 0 and u.max() <= m.width - 1 and v.min() >= 0 and v.max() <= g.v_usable
+    # a candidate's strip samples the ground from d0 + offset_m on, along the whole window
+    for d0 in (g.near_m, g.near_m + 0.5, g.near_m + 1.0):
+        i0 = fs.start_row(d0)
+        y = g.near_m + fs.offset_m + (i0 + 0.5) * fs.step_m
+        assert y == pytest.approx(d0 + fs.offset_m + 0.5 * fs.step_m, abs=fs.step_m / 2 + 1e-9)
+        n_x = fs.map_u.shape[1]
+        xs = (np.arange(n_x) - (n_x - 1) / 2.0) * fs.step_m
+        ue, ve, ok = m.ground_to_pixel(xs, np.full_like(xs, y))
+        assert ok.all()
+        assert np.abs(ue - u[i0]).max() < 1e-3 and np.abs(ve - v[i0]).max() < 1e-3
+    # same road from the near and the far end of the window: the far/near ratio is that of a level camera
+    # (at this quarter size both are ~0.95: the coarse test scale, not roll; full size 0.992 level vs
+    # 0.9916-0.9924 rolled, measured 6 Nov 2026)
+    def far_near(cam):
+        gg = SegmentGeometry.build(cam, Config())
+        f = FairSharpness(gg, gg.near_m, sc)
+        return f(_road(cam, 10.0 - (gg.near_m + 1.0)), gg.near_m + 1.0) / f(_road(cam, 10.0 - gg.near_m), gg.near_m)
+
+    assert far_near(m) == pytest.approx(far_near(_cam(scale=0.25)), abs=0.01)
+    # the selector builds with it and reports the offset
+    sel = BestFrameSelector(_segs(3), g, Config(segments=SegmentConfig(choice="nearest_sharp")).segments)
+    assert sel.fair_offsets_m == {f"{m.width}x{m.height}": pytest.approx(
+        FairSharpness(g, g.near_m, SegmentConfig()).offset_m)}
+
+
+def test_fair_sharpness_offset_is_zero_without_roll():
+    """A level camera keeps the exact pre-6-Nov sampling (offset 0), so earlier nearest_sharp results hold."""
+    for scale, grid in ((0.25, 16.0), (1.0, 4.0)):
+        m = _cam(scale=scale)
+        g = SegmentGeometry.build(m, Config())
+        assert FairSharpness(g, g.near_m, SegmentConfig(fair_grid_mm=grid)).offset_m == 0.0
+
+
 # ---- the choice rule with known fair values ---------------------------------------------------------
 
 def _coded_images(m):

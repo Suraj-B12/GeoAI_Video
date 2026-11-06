@@ -108,15 +108,16 @@ The reference is the VLM (Qwen2.5-VL-7B, zero-shot, IRC:82-2015 prompts, 4-bit, 
 
 Found by an adversarial review of the code and the data above. Each fix was measured before and after on the same data.
 
-Data and scripts: Capstone repo `eval_results/video_fixes/` (`STATUS.md` lists what is unfinished).
+Data and scripts: Capstone repo `eval_results/video_fixes/` (`STATUS.md` = state and resume notes; gate and timing: `gate_speed/results.json`). Extraction timings: RTX A5000, 2026-10-28, GPU lock held, VLM server resident and idle, before ×2 / after ×2 / after-default ×1 interleaved, repetitions within 0.5 s.
 
 | Change | Result | Adopted |
 |---|---|---|
 | `--profile video` (VLM skips record-only probe tiles) | Normal 13.72 → 3.76 s, Distress 24.41 → 14.43 s per frame; 60/60 answers identical; runner 14.4 → 5.2 s/image | **Yes** |
-| Sharpness on uint8 luma | ~2.9× faster per call; same frame on 811/813 segments | Safe, not yet on |
-| Probe-only gate | held out by drive: recall 87.8 % [78.5, 95.2] at 59.4 % pass (target 90 %) | No |
+| Gate scored on its own thread beside decoding (default config) | extraction of the 3 drives (4.06 km) 937 → 722 s, 231 → 178 s/km (1.30×); every record, PNG and sidecar byte-identical | **Yes** (`ce82205`) |
+| Sharpness on uint8 luma | ~2.9× faster per call (31–36 → 10–13 ms); a different frame on 2 of 813 segments (both d47c); pre-registered rule required all identical | No |
+| Probe-only gate | held out by drive: recall 87.8 % [78.5, 95.2] at 59.4 % pass (target 90 %); no pre-registered variant beats it; extraction would drop to 88 s/km (no bank, 2.6×) and VLM time by ~13 min/km | No (defaults kept; opt-in `calibration/segments_probe_gate.json`) |
 | `vlm.image=band` | 84.1 % agreement with whole frames (κ 0.68); flips split band 21 / frame 17 / unclear 14 | No (`image=frame`) |
-| `segments.choice=nearest_sharp` | re-extracted, not yet analysed | Pending |
+| `segments.choice=nearest_sharp` | could not run on any real drive before 6 Nov: the S21 mounts are rolled 1.2–4.4°, so the fair-sharpness strip of the nearest candidate fell below the image ("strip leaves the image"); fixed (strip starts 0.034–0.111 m into the segment, same for every candidate). A/B on d47c running | Pending |
 
 ## 9b. The survey at scale (29 Oct): 22 drives through the toggle
 
