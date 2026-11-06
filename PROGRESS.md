@@ -15,7 +15,11 @@ Updated as work lands. If a session ends mid-task, a new session can continue fr
   - **Decision:** defaults kept, because the probe-only gate's held-out recall is 87.8 % < 90 %.
 - **Luma sharpness:** not adopted. The pre-registered rule needed all frames identical; 2/813 differ.
 - **Tests:** CPU suite 256 passed, 12 skipped (GPU-only).
-- **Pending:** the nearest_sharp A/B on d47c (VLM answers on the segments whose frame changes). Resume notes: Capstone `eval_results/video_fixes/STATUS.md`.
+- **nearest_sharp A/B on d47c (done 6 Nov):**
+  - **Frames:** 225/528 segments change frame. The chosen frames are nearer (2.10 → 1.63 m) and finer (9.7 → 7.1 mm/px); the VLM agrees on 200/225.
+  - **Flips:** nearest 12 / sharpest 4 / unclear 9, by one non-blind look. That meets the pre-registered bar with zero margin.
+  - **Decision:** the default stays `sharpest` until an expert checks the 25 flips blind. Sheets: `C:\GeoAI\analysis\fixes\vlm_view\judge_nearest\`.
+  - **Resume notes:** Capstone `eval_results/video_fixes/STATUS.md`.
 
 ## State on 28 Oct 2026, evening (stopped by the usage limit)
 
